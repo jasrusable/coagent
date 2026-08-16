@@ -1,0 +1,2020 @@
+#!/usr/bin/env node
+'use strict';
+
+// coagent — multi-peer agent for Claude Code or Grok Build.
+//
+// Stack: human → lead agent → coagent peer(s)
+//
+// Peers: default "main", or --peer <uuid>|new. Each peer has its own session,
+// state, outbox, and jobs. Digest of the lead conversation is shared.
+//
+// Usage:
+//   coagent [opts] "<message>"                 foreground (peer main, or --peer)
+//   coagent [opts] bg [--parallel] "<msg>"     background job → prints job id
+//   coagent [opts] join [jobId] [--raw] [sec]  wait for job
+//   coagent [opts] jobs | peers | status | reset | rm | lead | digest | transcript | doctor
+//   coagent [opts] watch [-f] [--timeout N] [interval_s]
+//   coagent [opts] outbox [list|path|cat <file>]
+//
+// Options: --peer, --lead, --model backend[/id], --persona, --save, --raw, --parallel, …
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+const { spawn, spawnSync } = require('child_process');
+
+const digestLib = require(path.join(os.homedir(), '.coagent', 'lib', 'digest.js'));
+
+const HOME = os.homedir();
+const ROOT = path.join(HOME, '.coagent');
+const PERSONA_FILE = path.join(ROOT, 'persona.md');
+const PERSONAS_DIR = path.join(ROOT, 'personas');
+const STATE_DIR = path.join(ROOT, 'state');
+const CLAUDE_PROJECTS = path.join(HOME, '.claude', 'projects');
+const GROK_HOME = process.env.GROK_HOME || path.join(HOME, '.grok');
+const GROK_SESSIONS = path.join(GROK_HOME, 'sessions');
+const GROK_ACTIVE = path.join(GROK_HOME, 'active_sessions.json');
+const VALID = new Set(['auto', 'claude', 'grok']);
+const DEFAULT_PEER = 'main';
+
+const INHERITANCE_PREAMBLE = [
+  'You inherit the lead agent\'s full instruction stack (global CLAUDE.md / AGENTS.md and any',
+  'project CLAUDE.md/AGENTS.md, plus whatever the active harness loads) on top of this persona.',
+  'Treat those as shared context — principles, conventions, and project knowledge the lead',
+  'operates under. But they are written addressed to the lead, not you: where they tell "you"',
+  'to consult, loop in, or background a message to the co-agent, that co-agent IS you — you have',
+  'no co-agent of your own to consult, so do not act on those directions. You are the peer',
+  'being referred to; just be that peer.',
+  '',
+  'You are a full peer agent for the lead — same kind of capability surface, standing thread,',
+  'shared tree. Handle whatever the lead needs. Lead with the bottom line; be direct; no filler.',
+  '',
+  'Outbox: for durable work products (long reviews, checklists, findings, plans), write files',
+  'under the outbox directory you are given. Clear names (review.md, …). Chat reply = short',
+  'summary + full path(s). Short answers can stay chat-only.',
+].join(' ');
+
+const fail = (msg) => { console.error(`coagent: ${msg}`); process.exit(1); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+function childPidsOf(pid) {
+  try {
+    const r = spawnSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' });
+    if (r.status !== 0 && r.status !== 1) return [];
+    return String(r.stdout || '').split(/\s+/).map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n) && n > 1);
+  } catch { return []; }
+}
+
+async function killTree(pid) {
+  if (!pid || pid === process.pid) return;
+  const stack = [pid];
+  const seen = new Set();
+  const all = [];
+  while (stack.length) {
+    const p = stack.pop();
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    all.push(p);
+    for (const c of childPidsOf(p)) stack.push(c);
+  }
+  for (const p of all.reverse()) { try { process.kill(p, 'SIGTERM'); } catch { /* */ } }
+  for (let i = 0; i < 30; i++) { if (!all.some(isAlive)) break; await sleep(50); }
+  for (const p of all.reverse()) {
+    if (isAlive(p)) { try { process.kill(p, 'SIGKILL'); } catch { /* */ } }
+  }
+  for (let i = 0; i < 20; i++) { if (!all.some(isAlive)) break; await sleep(50); }
+}
+
+function atomicWrite(p, data) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, p);
+}
+function ensureDir(d) { fs.mkdirSync(d, { recursive: true }); }
+fs.mkdirSync(STATE_DIR, { recursive: true });
+
+// ─── paths (lead + peer) ────────────────────────────────────────────────────
+
+function leadDir(leadSid) { const d = path.join(STATE_DIR, leadSid); ensureDir(d); return d; }
+function peersRoot(leadSid) { const d = path.join(leadDir(leadSid), 'peers'); ensureDir(d); return d; }
+function peerDir(leadSid, peerId) {
+  const id = peerId || DEFAULT_PEER;
+  const d = path.join(peersRoot(leadSid), id);
+  ensureDir(d);
+  return d;
+}
+
+const digestMdPath = (leadSid) => path.join(leadDir(leadSid), 'context.md');
+const digestJsonPath = (leadSid) => path.join(leadDir(leadSid), 'context.json');
+
+const statePath = (leadSid, peerId) => path.join(peerDir(leadSid, peerId), 'state.json');
+const lastReplyPath = (leadSid, peerId) => path.join(peerDir(leadSid, peerId), 'last_reply.md');
+const lastReplyMetaPath = (leadSid, peerId) => path.join(peerDir(leadSid, peerId), 'last_reply.json');
+function jobsDir(leadSid, peerId) {
+  const d = path.join(peerDir(leadSid, peerId), 'jobs');
+  ensureDir(d);
+  return d;
+}
+const jobPath = (leadSid, peerId, jobId) => path.join(jobsDir(leadSid, peerId), `${jobId}.json`);
+const jobReplyPath = (leadSid, peerId, jobId) => path.join(jobsDir(leadSid, peerId), `${jobId}.reply.md`);
+const jobLogPath = (leadSid, peerId, jobId) => path.join(jobsDir(leadSid, peerId), `${jobId}.log`);
+function outboxDir(leadSid, peerId) {
+  const d = path.join(peerDir(leadSid, peerId), 'outbox');
+  ensureDir(d);
+  return d;
+}
+
+function migratePeersLayout(leadSid) {
+  // Old: state/<lead>/state.json, outbox/, jobs/, last_reply.*
+  // New: state/<lead>/peers/<peerId>/{state,outbox,jobs,last_reply.*}
+  // Digest stays at state/<lead>/context.*
+  const legacyFlat = path.join(STATE_DIR, `${leadSid}.json`);
+  const ld = leadDir(leadSid);
+  if (fs.existsSync(legacyFlat)) {
+    const dest = path.join(ld, 'state.json');
+    if (!fs.existsSync(dest)) {
+      try { fs.renameSync(legacyFlat, dest); } catch {
+        try { fs.copyFileSync(legacyFlat, dest); } catch { /* */ }
+      }
+    }
+  }
+
+  const mainD = peerDir(leadSid, DEFAULT_PEER);
+  const oldState = path.join(ld, 'state.json');
+  const newState = statePath(leadSid, DEFAULT_PEER);
+  if (fs.existsSync(oldState) && !fs.existsSync(newState)) {
+    try { fs.renameSync(oldState, newState); } catch {
+      try { fs.copyFileSync(oldState, newState); } catch { /* */ }
+    }
+  }
+  for (const name of ['outbox', 'jobs']) {
+    const oldD = path.join(ld, name);
+    const newD = path.join(mainD, name);
+    if (fs.existsSync(oldD) && !fs.existsSync(newD)) {
+      try { fs.renameSync(oldD, newD); } catch { /* */ }
+    }
+  }
+  for (const name of ['last_reply.md', 'last_reply.json', 'bg.log']) {
+    const oldP = path.join(ld, name);
+    const newP = path.join(mainD, name);
+    if (fs.existsSync(oldP) && !fs.existsSync(newP)) {
+      try { fs.renameSync(oldP, newP); } catch { /* */ }
+    }
+  }
+}
+
+function listPeerIds(leadSid) {
+  migratePeersLayout(leadSid);
+  const root = peersRoot(leadSid);
+  if (!fs.existsSync(root)) return [];
+  return fs.readdirSync(root).filter((n) => {
+    if (n.startsWith('.')) return false;
+    try { return fs.statSync(path.join(root, n)).isDirectory(); } catch { return false; }
+  }).sort((a, b) => {
+    if (a === DEFAULT_PEER) return -1;
+    if (b === DEFAULT_PEER) return 1;
+    return a.localeCompare(b);
+  });
+}
+
+function loadState(leadSid, peerId) {
+  migratePeersLayout(leadSid);
+  const p = statePath(leadSid, peerId);
+  if (!fs.existsSync(p)) return {};
+  try {
+    const s = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return normalizePeerState(s, peerId);
+  } catch { return {}; }
+}
+const saveState = (leadSid, peerId, s) =>
+  atomicWrite(statePath(leadSid, peerId), JSON.stringify(s, null, 2));
+
+function loadJob(leadSid, peerId, jobId) {
+  const p = jobPath(leadSid, peerId, jobId);
+  if (!fs.existsSync(p)) return null;
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
+}
+const saveJob = (leadSid, peerId, job) =>
+  atomicWrite(jobPath(leadSid, peerId, job.id), JSON.stringify(job, null, 2));
+
+function listJobs(leadSid, peerId) {
+  const dir = jobsDir(leadSid, peerId);
+  const out = [];
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith('.json')) continue;
+    try { out.push(JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))); } catch { /* */ }
+  }
+  out.sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
+  return out;
+}
+
+function listAllJobs(leadSid) {
+  const out = [];
+  for (const peerId of listPeerIds(leadSid)) {
+    for (const j of listJobs(leadSid, peerId)) {
+      out.push({ ...j, peerId });
+    }
+  }
+  out.sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
+  return out;
+}
+
+function findJob(leadSid, jobId, preferredPeer) {
+  if (preferredPeer) {
+    const j = loadJob(leadSid, preferredPeer, jobId);
+    if (j) return { job: j, peerId: preferredPeer };
+  }
+  for (const peerId of listPeerIds(leadSid)) {
+    const j = loadJob(leadSid, peerId, jobId);
+    if (j) return { job: j, peerId };
+  }
+  return null;
+}
+
+function newJobId() {
+  return crypto.randomBytes(4).toString('hex');
+}
+
+function listOutbox(leadSid, peerId) {
+  const dir = outboxDir(leadSid, peerId);
+  const entries = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (name.startsWith('.')) continue;
+    const p = path.join(dir, name);
+    let st; try { st = fs.statSync(p); } catch { continue; }
+    if (!st.isFile()) continue;
+    entries.push({ name, path: p, size: st.size, mtimeMs: st.mtimeMs, mtime: st.mtime.toISOString(), peerId });
+  }
+  entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return entries;
+}
+
+function allOutboxIndex(leadSid) {
+  const entries = [];
+  for (const peerId of listPeerIds(leadSid)) {
+    for (const e of listOutbox(leadSid, peerId)) {
+      entries.push({
+        name: `${peerId}/${e.name}`,
+        size: e.size,
+        mtime: e.mtime,
+        path: e.path,
+      });
+    }
+  }
+  return entries;
+}
+
+function formatOutboxListing(entries, { limit = 20 } = {}) {
+  if (!entries.length) return '(empty)';
+  return entries.slice(0, limit).map((e) => {
+    const kb = e.size < 1024 ? `${e.size}B` : `${(e.size / 1024).toFixed(1)}K`;
+    return `${e.name}  ${kb}  ${ageLabel(e.mtimeMs)}  ${e.path}`;
+  }).join('\n') + (entries.length > limit ? `\n… +${entries.length - limit} more` : '');
+}
+
+function ageLabel(isoOrMs) {
+  if (isoOrMs == null) return null;
+  const t = typeof isoOrMs === 'number' ? isoOrMs : Date.parse(isoOrMs);
+  if (!Number.isFinite(t)) return null;
+  const sec = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (sec < 60) return `${sec}s ago`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.round(sec / 3600)}h ago`;
+  return `${Math.round(sec / 86400)}d ago`;
+}
+
+function clip(s, n) {
+  return digestLib.clip(s, n, HOME);
+}
+
+// ─── args ───────────────────────────────────────────────────────────────────
+
+function printHelp() {
+  console.log(`coagent — multi-peer agent for Claude Code or Grok Build
+
+Usage:
+  coagent [opts] "<message>"                 foreground (default peer: main)
+  coagent [opts] bg [--parallel] "<msg>"     background job → prints job id
+  coagent [opts] join [jobId] [--raw] [sec]  wait for job (default: latest; 600s)
+  coagent [opts] jobs                        list jobs (all peers)
+  coagent [opts] peers                       list peers
+  coagent [opts] status | reset | rm | lead | digest | transcript | doctor
+  coagent [opts] watch [-f|--follow] [--timeout N] [interval_s]
+  coagent [opts] outbox [list|path|cat <file>]
+
+Peers:
+  (no --peer)            use peer "main" (created on first message)
+  --peer <uuid>          resume that peer, or create with that id
+  --peer new             mint a new uuid peer, print id, continue
+
+Options:
+  --lead, -l    auto|claude|grok
+  --model, -m   <spec>             backend or backend/modelId (e.g. claude, claude/opus, grok)
+                                   sticky on create; call override unless --save
+  --persona     <name|path>        sticky on create; call override unless --save
+  --save                           persist --model/--persona on peer
+  --raw                            join: print answer body only
+  --parallel                       bg: isolated peer session (safe concurrent on same peer)
+  --follow, -f                     watch: stream
+  --timeout N                      watch: exit after N seconds (0 = none)
+  --help, -h
+
+  ( --backend is rejected — use --model claude/… or --model grok/… )
+
+Env: COAGENT_MODEL (claude or claude/opus), COAGENT_LEAD, COAGENT_PERSONA,
+     COAGENT_PEER, COAGENT_LEAD_TRANSCRIPT, COAGENT_LEAD_SESSION_ID,
+     GROK_SESSION_ID, CLAUDE_CODE_SESSION_ID
+Home: ${ROOT}
+`);
+}
+
+function parseArgs(argv) {
+  let lead = null;
+  let peer = null; // null = main; 'new' = mint; string = id
+  let modelSpec = null; // "claude" | "claude/opus" | "grok" | "grok/<id>"
+  let persona = null;
+  let save = false;
+  let follow = false;
+  let raw = false;
+  let parallel = false;
+  let timeoutSec = null;
+  const rest = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--help' || a === '-h') return { help: true };
+    if (a === '--backend' || a === '-b' || a.startsWith('--backend=')) {
+      fail('use --model backend[/modelId] instead of --backend (e.g. --model claude/opus)');
+    }
+    if (a === '--lead' || a === '-l') { lead = argv[++i]; continue; }
+    if (a.startsWith('--lead=')) { lead = a.slice(7); continue; }
+    if (a === '--peer') {
+      const n = argv[i + 1];
+      if (n && !n.startsWith('-')) { peer = argv[++i]; }
+      else { peer = 'new'; }
+      continue;
+    }
+    if (a.startsWith('--peer=')) { peer = a.slice(7) || 'new'; continue; }
+    if (a === '--model' || a === '-m') { modelSpec = argv[++i]; continue; }
+    if (a.startsWith('--model=')) { modelSpec = a.slice(8); continue; }
+    if (a === '--persona') { persona = argv[++i]; continue; }
+    if (a.startsWith('--persona=')) { persona = a.slice(10); continue; }
+    if (a === '--save') { save = true; continue; }
+    if (a === '--follow' || a === '-f') { follow = true; continue; }
+    if (a === '--raw') { raw = true; continue; }
+    if (a === '--parallel') { parallel = true; continue; }
+    if (a === '--timeout') { timeoutSec = Number(argv[++i]); continue; }
+    if (a.startsWith('--timeout=')) { timeoutSec = Number(a.slice(10)); continue; }
+    if (a.startsWith('-') && a !== '-') fail(`unknown option ${a} (try --help)`);
+    rest.push(a);
+  }
+  return { lead, peer, modelSpec, persona, save, follow, raw, parallel, timeoutSec, rest };
+}
+
+function normalizeChoice(v, label) {
+  if (v == null || v === '') return 'auto';
+  const n = String(v).toLowerCase().trim();
+  if (!VALID.has(n)) fail(`${label} must be auto|claude|grok (got ${v})`);
+  return n;
+}
+
+/** @returns {{ backendChoice: string, modelId: string|null, raw: string|null }} */
+function parseModelSpec(spec) {
+  if (spec == null || spec === '') {
+    return { backendChoice: null, modelId: null, raw: null };
+  }
+  const s = String(spec).trim();
+  if (!s) return { backendChoice: null, modelId: null, raw: null };
+
+  if (s.includes('/')) {
+    const i = s.indexOf('/');
+    const be = s.slice(0, i).trim();
+    const modelId = s.slice(i + 1).trim() || null;
+    const backendChoice = normalizeChoice(be, '--model backend');
+    if (backendChoice === 'auto') {
+      fail('--model auto/… is not valid; use claude/… or grok/…');
+    }
+    if (!modelId) fail(`--model ${s}: missing model id after /`);
+    return { backendChoice, modelId, raw: s };
+  }
+
+  const lower = s.toLowerCase();
+  if (VALID.has(lower)) {
+    return { backendChoice: normalizeChoice(s, '--model'), modelId: null, raw: s };
+  }
+  fail(
+    `--model must be "claude", "grok", "auto", or "backend/modelId" ` +
+    `(e.g. claude/opus, grok/…). Got: ${s}`,
+  );
+}
+
+function formatModelSpec(backendChoice, modelId) {
+  if (!backendChoice || backendChoice === 'auto') {
+    return modelId || null;
+  }
+  return modelId ? `${backendChoice}/${modelId}` : backendChoice;
+}
+
+function normalizePeerState(s, peerId) {
+  if (!s || typeof s !== 'object') return {};
+  const next = { ...s, peerId: s.peerId || peerId };
+  if (!next.modelSpec) {
+    const be = (next.backendChoice && next.backendChoice !== 'auto')
+      ? next.backendChoice
+      : (next.backend || null);
+    next.modelSpec = formatModelSpec(be, next.model || null) || be || null;
+  }
+  return next;
+}
+
+function peerModelLabel(s) {
+  if (!s) return null;
+  if (s.modelSpec) return s.modelSpec;
+  const be = (s.backendChoice && s.backendChoice !== 'auto') ? s.backendChoice : (s.backend || null);
+  return formatModelSpec(be, s.model || null) || be || null;
+}
+
+function resolvePeerId(cli, { allowMint = true } = {}) {
+  const fromEnv = process.env.COAGENT_PEER || null;
+  let raw = cli.peer != null ? cli.peer : fromEnv;
+  if (raw == null || raw === '' || raw === DEFAULT_PEER) {
+    return { peerId: DEFAULT_PEER, minted: false };
+  }
+  if (raw === 'new' || raw === 'NEW') {
+    if (!allowMint) {
+      fail('--peer new only applies when sending a message (fg/bg), not list/status commands');
+    }
+    return { peerId: crypto.randomUUID(), minted: true };
+  }
+  return { peerId: String(raw).trim(), minted: false };
+}
+
+function resolvePersonaPath(flagOrSticky) {
+  if (!flagOrSticky) return PERSONA_FILE;
+  const v = String(flagOrSticky).trim();
+  if (!v) return PERSONA_FILE;
+  if (v.startsWith('/') || v.startsWith('~') || v.includes('/')) {
+    return v.startsWith('~') ? path.join(HOME, v.slice(1)) : v;
+  }
+  // name → ~/.coagent/personas/<name>.md or <name>
+  const candidates = [
+    path.join(PERSONAS_DIR, `${v}.md`),
+    path.join(PERSONAS_DIR, v),
+    path.join(ROOT, `${v}.md`),
+    v,
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  fail(`persona not found: ${v} (tried ${candidates.slice(0, 3).join(', ')})`);
+}
+
+function loadPersona(personaPath) {
+  const p = personaPath || PERSONA_FILE;
+  if (!fs.existsSync(p)) fail(`no persona at ${p}`);
+  const raw = fs.readFileSync(p, 'utf8');
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  const meta = {};
+  let body = raw;
+  if (m) {
+    body = m[2];
+    for (const line of m[1].split('\n')) {
+      const kv = line.match(/^(\w+):\s*(.*)$/);
+      if (kv) meta[kv[1]] = kv[2].trim();
+    }
+  }
+  return {
+    path: p,
+    effort: meta.effort || 'high',
+    // model in frontmatter is deprecated; still accepted as fallback
+    model: meta.model || null,
+    backend: meta.backend || null,
+    lead: meta.lead || null,
+    permissionMode: meta.permissionMode || 'bypassPermissions',
+    allowedTools: meta.allowedTools || null,
+    disallowedTools: meta.disallowedTools || null,
+    mcp: meta.mcp || 'on',
+    persona: body.trim(),
+  };
+}
+
+// ─── process / lead resolution ──────────────────────────────────────────────
+
+function ancestorPids() {
+  const out = [];
+  let pid = process.pid;
+  for (let i = 0; i < 48; i++) {
+    out.push(pid);
+    let ppid;
+    try {
+      const r = spawnSync('ps', ['-p', String(pid), '-o', 'ppid='], { encoding: 'utf8' });
+      ppid = parseInt(String(r.stdout || '').trim(), 10);
+    } catch { break; }
+    if (!Number.isFinite(ppid) || ppid <= 1 || ppid === pid) break;
+    pid = ppid;
+  }
+  return out;
+}
+
+function findClaudeTranscriptBySid(sid) {
+  if (!sid || !fs.existsSync(CLAUDE_PROJECTS)) return null;
+  for (const d of fs.readdirSync(CLAUDE_PROJECTS)) {
+    const t = path.join(CLAUDE_PROJECTS, d, `${sid}.jsonl`);
+    if (fs.existsSync(t)) return t;
+  }
+  return null;
+}
+
+function findClaudeTranscriptByCwd() {
+  if (!fs.existsSync(CLAUDE_PROJECTS)) return null;
+  const cwd = process.cwd();
+  let best = null;
+  let bestM = 0;
+  for (const d of fs.readdirSync(CLAUDE_PROJECTS)) {
+    const dir = path.join(CLAUDE_PROJECTS, d);
+    let st;
+    try { st = fs.statSync(dir); } catch { continue; }
+    if (!st.isDirectory()) continue;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.jsonl')) continue;
+      const t = path.join(dir, f);
+      try {
+        const m = fs.statSync(t).mtimeMs;
+        if (m > bestM) { bestM = m; best = t; }
+      } catch { /* */ }
+    }
+  }
+  return best;
+}
+
+function resolveClaudeLead(explicitSid) {
+  const sid = explicitSid || process.env.CLAUDE_CODE_SESSION_ID || null;
+  if (sid) {
+    const t = findClaudeTranscriptBySid(sid);
+    if (t) return { harness: 'claude', sessionId: sid, transcriptPath: t, pin: 'env' };
+  }
+  const t = findClaudeTranscriptByCwd();
+  if (t) {
+    return {
+      harness: 'claude',
+      sessionId: path.basename(t).replace(/\.jsonl$/, ''),
+      transcriptPath: t,
+      pin: 'cwd-mtime',
+    };
+  }
+  return null;
+}
+
+function encodeGrokCwd(cwd) { return encodeURIComponent(cwd); }
+
+function grokSessionDir(sessionId, cwd) {
+  if (cwd) {
+    const p = path.join(GROK_SESSIONS, encodeGrokCwd(cwd), sessionId);
+    if (fs.existsSync(p)) return p;
+  }
+  if (!fs.existsSync(GROK_SESSIONS)) return null;
+  for (const d of fs.readdirSync(GROK_SESSIONS)) {
+    const p = path.join(GROK_SESSIONS, d, sessionId);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+function readGrokActive() {
+  if (!fs.existsSync(GROK_ACTIVE)) return [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(GROK_ACTIVE, 'utf8'));
+    return Array.isArray(raw) ? raw : (raw.sessions || []);
+  } catch { return []; }
+}
+
+function cwdChain() {
+  const chain = [];
+  let cur = process.cwd();
+  for (let i = 0; i < 20; i++) {
+    chain.push(cur);
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return chain;
+}
+
+function injectGrokSessionEnv(sessionId) {
+  if (!sessionId) return;
+  if (!process.env.GROK_SESSION_ID) process.env.GROK_SESSION_ID = sessionId;
+  if (!process.env.COAGENT_LEAD_SESSION_ID) process.env.COAGENT_LEAD_SESSION_ID = sessionId;
+}
+
+function resolveGrokLead(explicitSid) {
+  const envSid = explicitSid || process.env.GROK_SESSION_ID || process.env.COAGENT_LEAD_SESSION_ID || null;
+  if (envSid) {
+    const dir = grokSessionDir(envSid, process.cwd()) || grokSessionDir(envSid);
+    if (dir) {
+      const transcriptPath = path.join(dir, 'updates.jsonl');
+      injectGrokSessionEnv(envSid);
+      return {
+        harness: 'grok',
+        sessionId: envSid,
+        transcriptPath,
+        pin: process.env.GROK_SESSION_ID === envSid ? 'env' : 'coagent-env',
+      };
+    }
+  }
+
+  const active = readGrokActive();
+  const ancestors = new Set(ancestorPids());
+  const byAncestor = active
+    .filter((s) => s && s.session_id && s.pid && ancestors.has(s.pid) && isAlive(s.pid));
+  if (byAncestor.length > 1) {
+    fail(`ambiguous Grok lead: ${byAncestor.length} sessions in ancestry. Set GROK_SESSION_ID.`);
+  }
+  if (byAncestor.length === 1) {
+    const s = byAncestor[0];
+    const dir = grokSessionDir(s.session_id, s.cwd);
+    if (dir) {
+      injectGrokSessionEnv(s.session_id);
+      return {
+        harness: 'grok',
+        sessionId: s.session_id,
+        transcriptPath: path.join(dir, 'updates.jsonl'),
+        pin: 'ancestor-pid',
+      };
+    }
+  }
+
+  const chain = cwdChain();
+  const byCwd = active
+    .filter((s) => s && s.session_id && s.cwd && chain.includes(s.cwd) && (!s.pid || isAlive(s.pid)));
+  if (byCwd.length > 1) {
+    fail(`ambiguous Grok lead: ${byCwd.length} active sessions for this cwd. Set GROK_SESSION_ID.`);
+  }
+  if (byCwd.length === 1) {
+    const s = byCwd[0];
+    const dir = grokSessionDir(s.session_id, s.cwd);
+    if (dir) {
+      injectGrokSessionEnv(s.session_id);
+      return {
+        harness: 'grok',
+        sessionId: s.session_id,
+        transcriptPath: path.join(dir, 'updates.jsonl'),
+        pin: 'cwd-active',
+      };
+    }
+  }
+
+  if (!fs.existsSync(GROK_SESSIONS)) return null;
+  let best = null;
+  let bestM = 0;
+  for (const cwd of chain) {
+    const group = path.join(GROK_SESSIONS, encodeGrokCwd(cwd));
+    if (!fs.existsSync(group)) continue;
+    for (const sid of fs.readdirSync(group)) {
+      const t = path.join(group, sid, 'updates.jsonl');
+      if (!fs.existsSync(t)) continue;
+      const m = fs.statSync(t).mtimeMs;
+      if (m > bestM) { bestM = m; best = { sessionId: sid, transcriptPath: t }; }
+    }
+  }
+  if (best) {
+    injectGrokSessionEnv(best.sessionId);
+    return { harness: 'grok', sessionId: best.sessionId, transcriptPath: best.transcriptPath, pin: 'cwd-mtime' };
+  }
+  return null;
+}
+
+function leadFromExplicitTranscript(transcriptPath) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
+  if (transcriptPath.includes(`${path.sep}updates.jsonl`) || transcriptPath.endsWith('updates.jsonl')) {
+    const sessionId = path.basename(path.dirname(transcriptPath));
+    injectGrokSessionEnv(sessionId);
+    return { harness: 'grok', sessionId, transcriptPath, pin: 'explicit-path' };
+  }
+  if (transcriptPath.endsWith('.jsonl')) {
+    return {
+      harness: 'claude',
+      sessionId: path.basename(transcriptPath).replace(/\.jsonl$/, ''),
+      transcriptPath,
+      pin: 'explicit-path',
+    };
+  }
+  return null;
+}
+
+function resolveLead(leadChoice) {
+  const explicit = process.env.COAGENT_LEAD_TRANSCRIPT || process.env.PANEL_TRANSCRIPT || null;
+  if (explicit) {
+    const L = leadFromExplicitTranscript(explicit);
+    if (L) return L;
+  }
+  const sidHint = process.env.COAGENT_LEAD_SESSION_ID || null;
+
+  if (leadChoice === 'claude') {
+    const L = resolveClaudeLead(sidHint);
+    if (L) return L;
+  }
+  if (leadChoice === 'grok') {
+    const L = resolveGrokLead(sidHint || process.env.GROK_SESSION_ID);
+    if (L) return L;
+  }
+  if (leadChoice === 'auto') {
+    if (process.env.CLAUDE_CODE_SESSION_ID) {
+      const L = resolveClaudeLead(process.env.CLAUDE_CODE_SESSION_ID);
+      if (L) return L;
+    }
+    if (process.env.GROK_SESSION_ID) {
+      const L = resolveGrokLead(process.env.GROK_SESSION_ID);
+      if (L) return L;
+    }
+    if (process.env.GROK_AGENT) {
+      const L = resolveGrokLead(null);
+      if (L) return L;
+    }
+    const g = resolveGrokLead(null);
+    if (g) return g;
+    const c = resolveClaudeLead(null);
+    if (c) return c;
+  }
+  fail('no lead conversation found. Set COAGENT_LEAD_TRANSCRIPT / GROK_SESSION_ID / CLAUDE_CODE_SESSION_ID.');
+}
+
+function resolveBackend(backendChoice, leadHarness) {
+  return backendChoice === 'auto' ? leadHarness : backendChoice;
+}
+
+// ─── digest ─────────────────────────────────────────────────────────────────
+
+function loadClaudeRecords(transcriptPath) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return [];
+  const out = [];
+  for (const line of fs.readFileSync(transcriptPath, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line)); } catch { /* */ }
+  }
+  return out;
+}
+
+function loadGrokUpdates(transcriptPath) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return [];
+  const out = [];
+  for (const line of fs.readFileSync(transcriptPath, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const o = JSON.parse(line);
+      // Primary stream + occasional x.ai-prefixed variants
+      if (o.method !== 'session/update' && o.method !== '_x.ai/session/update') continue;
+      const params = o.params || {};
+      const meta = params._meta || {};
+      out.push({
+        eventId: meta.eventId || o.eventId || null,
+        update: params.update || {},
+        timestamp: o.timestamp,
+        method: o.method,
+      });
+    } catch { /* */ }
+  }
+  return out;
+}
+
+function buildDigest(lead, sinceMarker) {
+  const records = lead.harness === 'claude'
+    ? loadClaudeRecords(lead.transcriptPath)
+    : loadGrokUpdates(lead.transcriptPath);
+
+  const result = digestLib.buildDigestFromRecords({
+    harness: lead.harness,
+    records,
+    sinceMarker,
+    home: HOME,
+    outboxIndex: allOutboxIndex(lead.sessionId),
+    transcriptPath: lead.transcriptPath,
+    pin: lead.pin || null,
+  });
+
+  const digestPath = digestMdPath(lead.sessionId);
+  const jsonPath = digestJsonPath(lead.sessionId);
+  atomicWrite(digestPath, result.markdown);
+  atomicWrite(jsonPath, JSON.stringify({
+    lead: lead.harness,
+    sessionId: lead.sessionId,
+    pin: lead.pin || null,
+    transcriptPath: lead.transcriptPath,
+    isDelta: result.isDelta,
+    lastMarker: result.lastMarker,
+    sinceMarker: sinceMarker || null,
+    fallbackNote: result.fallbackNote || null,
+    snapshot: result.side,
+    outbox: result.side.outbox || [],
+    updatedAt: new Date().toISOString(),
+  }, null, 2));
+
+  return {
+    digestPath,
+    jsonPath,
+    lastMarker: result.lastMarker,
+    isDelta: result.isDelta,
+    side: result.side,
+    fallbackNote: result.fallbackNote,
+    hardFallback: result.hardFallback,
+  };
+}
+
+// ─── peer runtimes ──────────────────────────────────────────────────────────
+
+function runCmd(cmd, args, onSpawn) {
+  return new Promise((resolve) => {
+    const childEnv = { ...process.env };
+    delete childEnv.GROK_AGENT;
+    delete childEnv.COAGENT_BG_WORKER;
+    const child = spawn(cmd, args, { cwd: process.cwd(), env: childEnv });
+    if (onSpawn) onSpawn(child.pid);
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('close', (code) => resolve({ code, out, err }));
+  });
+}
+
+function parsePeerResult(backend, out) {
+  let answer = (out || '').trim();
+  let sessionId = null;
+  let durMs = null;
+  let subtype = null;
+  let stopReason = null;
+  let isError = false;
+  try {
+    const j = JSON.parse(out);
+    if (backend === 'claude') {
+      answer = j.result || j.answer || answer;
+      sessionId = j.session_id || j.sessionId || null;
+      subtype = j.subtype || null;
+      isError = !!j.is_error;
+      durMs = j.duration_ms || null;
+      stopReason = j.stop_reason || null;
+    } else {
+      // grok json: { text, sessionId, stopReason, usage, ... }
+      let text = j.result || j.answer || j.text || null;
+      if (!text && j.message) {
+        text = typeof j.message === 'string' ? j.message
+          : (j.message.content || j.message.text || null);
+      }
+      if (text != null) answer = typeof text === 'string' ? text : JSON.stringify(text);
+      sessionId = j.sessionId || j.session_id || null;
+      subtype = j.subtype || j.stopReason || null;
+      isError = !!j.isError || !!j.is_error;
+      durMs = j.durationMs || j.duration_ms || null;
+      stopReason = j.stopReason || j.stop_reason || null;
+    }
+  } catch { /* plain text */ }
+  return { answer, sessionId, durMs, subtype, stopReason, isError };
+}
+
+function systemBundle(personaBody) {
+  return `${INHERITANCE_PREAMBLE}\n\n${personaBody}`;
+}
+
+function buildClaudeArgs({ prompt, effort, model, permissionMode, allowedTools, disallowedTools, mcp, persona, sessionId, resume }) {
+  const base = [
+    '-p', prompt,
+    '--output-format', 'json',
+    '--effort', effort,
+    '--permission-mode', permissionMode,
+    '--add-dir', STATE_DIR,
+  ];
+  if (allowedTools) base.push('--allowedTools', ...allowedTools.split(/[\s,]+/).filter(Boolean));
+  if (disallowedTools) base.push('--disallowedTools', ...disallowedTools.split(/[\s,]+/).filter(Boolean));
+  if (mcp === 'off') base.push('--strict-mcp-config');
+  if (model) base.push('--model', model);
+  if (resume) return [...base, '--resume', sessionId];
+  return [...base, '--session-id', sessionId, '--append-system-prompt', systemBundle(persona)];
+}
+
+function buildGrokArgs({ prompt, effort, model, permissionMode, allowedTools, disallowedTools, persona, sessionId, resume }) {
+  const base = [
+    '-p', prompt,
+    '--output-format', 'json',
+    '--effort', effort,
+    '--permission-mode', permissionMode,
+    '--always-approve',
+    '--rules', systemBundle(persona),
+  ];
+  if (allowedTools) base.push('--tools', allowedTools.split(/[\s,]+/).filter(Boolean).join(','));
+  if (disallowedTools) base.push('--disallowed-tools', disallowedTools.split(/[\s,]+/).filter(Boolean).join(','));
+  if (model) base.push('--model', model);
+  if (resume) return [...base, '--resume', sessionId];
+  return [...base, '--session-id', sessionId];
+}
+
+function newPeerSessionId() { return crypto.randomUUID(); }
+
+function findPeerTranscript(backend, peerSessionId) {
+  if (!peerSessionId) return null;
+  if (backend === 'claude') {
+    if (!fs.existsSync(CLAUDE_PROJECTS)) return null;
+    return fs.readdirSync(CLAUDE_PROJECTS)
+      .map((d) => path.join(CLAUDE_PROJECTS, d, `${peerSessionId}.jsonl`))
+      .find((p) => fs.existsSync(p)) || null;
+  }
+  const dir = grokSessionDir(peerSessionId, process.cwd()) || grokSessionDir(peerSessionId);
+  return dir ? path.join(dir, 'updates.jsonl') : null;
+}
+
+function whichBin(name) {
+  try {
+    const r = spawnSync('which', [name], { encoding: 'utf8' });
+    return r.status === 0 ? String(r.stdout || '').trim() : null;
+  } catch { return null; }
+}
+
+function writeReplyFiles(leadSid, peerId, { answer, meta, message, backend, peerSessionId, jobId }) {
+  const header = [
+    `# Co-agent reply`,
+    ``,
+    `**When:** ${new Date().toISOString()}`,
+    `**Peer:** ${peerId}`,
+    `**Backend:** ${backend}`,
+    peerSessionId ? `**Peer session:** ${peerSessionId}` : '',
+    jobId ? `**Job:** ${jobId}` : '',
+    message ? `**Asked:** ${clip(message, 300)}` : '',
+    ``,
+    answer,
+    ``,
+    meta ? `---\n_${meta}_` : '',
+  ].filter(Boolean).join('\n');
+
+  atomicWrite(lastReplyPath(leadSid, peerId), header);
+  atomicWrite(lastReplyMetaPath(leadSid, peerId), JSON.stringify({
+    at: new Date().toISOString(),
+    peerId,
+    backend,
+    peerSessionId: peerSessionId || null,
+    jobId: jobId || null,
+    message: message || null,
+    answer,
+    answerPreview: clip(answer, 400),
+    meta: meta || null,
+  }, null, 2));
+
+  if (jobId) {
+    atomicWrite(jobReplyPath(leadSid, peerId, jobId), header);
+  }
+  return { body: answer, wrapped: header };
+}
+
+function isRunAlive(s) {
+  return !!(s.running && (
+    (s.childPid && isAlive(s.childPid)) ||
+    (s.bgPid && isAlive(s.bgPid))
+  ));
+}
+
+function isJobAlive(job) {
+  if (!job || job.status !== 'running') return false;
+  return !!(
+    (job.childPid && isAlive(job.childPid)) ||
+    (job.workerPid && isAlive(job.workerPid))
+  );
+}
+
+// ─── context / talk ─────────────────────────────────────────────────────────
+
+function resolveContext(cli, opts = {}) {
+  const { peerId, minted } = resolvePeerId(cli, opts);
+  const defaultPersona = loadPersona(PERSONA_FILE);
+
+  const leadChoice = normalizeChoice(cli.lead ?? process.env.COAGENT_LEAD ?? defaultPersona.lead, 'lead');
+  const lead = resolveLead(leadChoice);
+  migratePeersLayout(lead.sessionId);
+
+  let state = loadState(lead.sessionId, peerId);
+  const isNew = !state.createdAt && !state.sessionId;
+
+  // Persona path: call flag → sticky → default
+  const personaPath = resolvePersonaPath(
+    cli.persona || process.env.COAGENT_PERSONA || state.personaPath || null,
+  );
+  const persona = loadPersona(personaPath);
+
+  // Combined model spec: call → env → sticky → persona → auto
+  // Spec form: "claude" | "grok" | "auto" | "claude/<modelId>" | "grok/<modelId>"
+  const callSpec = parseModelSpec(cli.modelSpec ?? process.env.COAGENT_MODEL ?? null);
+  const stickySpec = {
+    backendChoice: state.backendChoice || null,
+    modelId: state.model || null,
+  };
+  const personaBe = persona.backend ? normalizeChoice(persona.backend, 'persona backend') : null;
+
+  let backendChoice = callSpec.backendChoice
+    || stickySpec.backendChoice
+    || personaBe
+    || 'auto';
+  backendChoice = normalizeChoice(backendChoice, 'backend');
+  const backend = resolveBackend(backendChoice, lead.harness);
+
+  // Model id: only from explicit spec/sticky/persona frontmatter — never cross-backend
+  let model = null;
+  if (callSpec.raw != null) {
+    model = callSpec.modelId;
+  } else if (stickySpec.modelId) {
+    model = stickySpec.modelId;
+  } else if (persona.model && backendChoice !== 'auto' && backend === (persona.backend || backend)) {
+    model = persona.model; // legacy frontmatter fallback
+  }
+
+  const modelSpecDisplay = formatModelSpec(backendChoice === 'auto' ? backend : backendChoice, model);
+
+  // Persist sticky on create or --save
+  if (isNew || minted || cli.save) {
+    const next = {
+      ...state,
+      peerId,
+      createdAt: state.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    if (callSpec.raw != null || isNew || minted) {
+      next.backendChoice = backendChoice;
+      next.backend = backend;
+      next.model = model;
+      next.modelSpec = modelSpecDisplay;
+    }
+    if (cli.persona || process.env.COAGENT_PERSONA || isNew || minted) {
+      next.personaPath = personaPath;
+    }
+    if (cli.save) {
+      if (callSpec.raw != null) {
+        next.backendChoice = backendChoice;
+        next.backend = backend;
+        next.model = model;
+        next.modelSpec = modelSpecDisplay;
+      }
+      if (cli.persona) next.personaPath = personaPath;
+    }
+    saveState(lead.sessionId, peerId, next);
+    state = next;
+  } else if (!state.peerId) {
+    saveState(lead.sessionId, peerId, {
+      ...state,
+      peerId,
+      createdAt: state.createdAt || new Date().toISOString(),
+      backend: state.backend || backend,
+      backendChoice: state.backendChoice || backendChoice,
+      personaPath: state.personaPath || personaPath,
+      model: state.model || model || null,
+      modelSpec: state.modelSpec || modelSpecDisplay || null,
+    });
+    state = loadState(lead.sessionId, peerId);
+  }
+
+  return {
+    persona,
+    personaPath,
+    lead,
+    backend,
+    backendChoice,
+    leadChoice,
+    peerId,
+    minted,
+    model,
+    modelSpec: modelSpecDisplay,
+    state,
+  };
+}
+
+function buildPrompt({ dig, lead, backend, message, leadSid, peerId, jobId, isolated }) {
+  const box = outboxDir(leadSid, peerId);
+  const existing = listOutbox(leadSid, peerId);
+  const existingNote = existing.length
+    ? [
+        `Existing outbox files:`,
+        ...existing.slice(0, 15).map((e) => `  - ${e.name} (${ageLabel(e.mtimeMs)}, ${e.size}B)`),
+      ].join('\n')
+    : 'Outbox is currently empty.';
+
+  return [
+    `You are the lead agent's standing peer agent (full capability, shared workspace).`,
+    `Peer id: ${peerId}.`,
+    isolated ? `This is an isolated parallel job (${jobId}); you may not share memory with this peer's main thread.` : '',
+    ``,
+    `Shared lead context (read first, every time):`,
+    `  ${dig.digestPath}`,
+    dig.jsonPath ? `Structured snapshot JSON: ${dig.jsonPath}` : '',
+    `Peer state dir: ${peerDir(leadSid, peerId)}`,
+    `Outbox: ${box}`,
+    existingNote,
+    `Write durable artifacts to the outbox. Reply: short summary + full path(s).`,
+    `Digest is full on first contact, then mostly a delta (with fallback anchors when needed).`,
+    `Raw lead transcript: ${lead.transcriptPath}`,
+    ``,
+    `Lead harness: ${lead.harness} (pin=${lead.pin || '?'}). Peer backend: ${backend}.`,
+    jobId ? `Job id: ${jobId}.` : '',
+    ``,
+    `The lead agent says:`,
+    message,
+  ].filter(Boolean).join('\n');
+}
+
+async function talk(message, cli, opts = {}) {
+  const {
+    background = false,
+    jobId = null,
+    isolated = false,
+  } = opts;
+
+  const ctx = resolveContext(cli);
+  const {
+    persona, lead, backend, peerId, minted, model,
+  } = ctx;
+  let state = loadState(lead.sessionId, peerId);
+  const mainSid = lead.sessionId;
+
+  if (minted) {
+    console.error(`coagent: new peer ${peerId}`);
+  }
+
+  // Backend change on same peer → new chat session
+  if (!isolated && state.sessionId && state.backend && state.backend !== backend) {
+    state = { ...state, sessionId: null, lastUuid: null, childPid: null };
+  }
+
+  const existing = !isolated && !!state.sessionId;
+  const myToken = crypto.randomUUID();
+  const isBgWorker = process.env.COAGENT_BG_WORKER === '1' || background;
+
+  // Kill prior runs for THIS peer only (other peers keep running)
+  const toKill = [];
+  if (!isolated) {
+    if (state.childPid && state.childPid !== process.pid) toKill.push(state.childPid);
+    if (state.bgPid && state.bgPid !== process.pid) toKill.push(state.bgPid);
+    if (!isBgWorker) {
+      for (const j of listJobs(mainSid, peerId)) {
+        if (isJobAlive(j)) {
+          if (j.childPid) toKill.push(j.childPid);
+          if (j.workerPid) toKill.push(j.workerPid);
+          saveJob(mainSid, peerId, { ...j, status: 'superseded', finishedAt: new Date().toISOString() });
+        }
+      }
+    }
+  }
+
+  if (!isolated) {
+    saveState(mainSid, peerId, {
+      ...state,
+      peerId,
+      token: myToken,
+      childPid: null,
+      bgPid: isBgWorker ? process.pid : null,
+      backend,
+      lead: lead.harness,
+      pin: lead.pin || null,
+      model: model || state.model || null,
+      personaPath: persona.path || state.personaPath || null,
+      running: true,
+      lastQuestion: message,
+      lastQuestionAt: new Date().toISOString(),
+      bg: isBgWorker,
+      startedAt: new Date().toISOString(),
+      lastFinishedAt: null,
+      lastError: null,
+      currentJobId: jobId || null,
+    });
+  }
+
+  if (jobId) {
+    const job = loadJob(mainSid, peerId, jobId) || { id: jobId };
+    saveJob(mainSid, peerId, {
+      ...job,
+      id: jobId,
+      status: 'running',
+      message,
+      backend,
+      peerId,
+      model: model || null,
+      isolated: !!isolated,
+      workerPid: isBgWorker ? process.pid : null,
+      childPid: null,
+      startedAt: job.startedAt || new Date().toISOString(),
+    });
+  }
+
+  for (const pid of [...new Set(toKill)]) {
+    if (isAlive(pid)) await killTree(pid);
+  }
+
+  const superseded = () => {
+    if (isolated && jobId) {
+      const j = loadJob(mainSid, peerId, jobId);
+      return j && j.status === 'superseded';
+    }
+    return loadState(mainSid, peerId).token !== myToken;
+  };
+
+  const dig = buildDigest(lead, existing ? state.lastUuid : null);
+  let lastMarker = dig.lastMarker;
+
+  const prompt = buildPrompt({
+    dig, lead, backend, message, leadSid: mainSid, peerId, jobId, isolated,
+  });
+
+  const common = {
+    prompt,
+    effort: persona.effort,
+    model: model || null,
+    permissionMode: persona.permissionMode,
+    allowedTools: persona.allowedTools,
+    disallowedTools: persona.disallowedTools,
+    mcp: persona.mcp,
+    persona: persona.persona,
+  };
+
+  const mkNew = () => {
+    const sid = newPeerSessionId();
+    const args = backend === 'claude'
+      ? buildClaudeArgs({ ...common, sessionId: sid, resume: false })
+      : buildGrokArgs({ ...common, sessionId: sid, resume: false });
+    return { sid, args };
+  };
+
+  let run = (existing && !isolated)
+    ? {
+        sid: state.sessionId,
+        args: backend === 'claude'
+          ? buildClaudeArgs({ ...common, sessionId: state.sessionId, resume: true })
+          : buildGrokArgs({ ...common, sessionId: state.sessionId, resume: true }),
+      }
+    : mkNew();
+
+  const stamp = (sid) => (childPid) => {
+    if (superseded()) return;
+    if (!isolated) {
+      const s = loadState(mainSid, peerId);
+      if (s.token !== myToken) return;
+      saveState(mainSid, peerId, {
+        ...s,
+        sessionId: sid,
+        childPid,
+        bgPid: isBgWorker ? process.pid : null,
+        backend,
+        lead: lead.harness,
+        pin: lead.pin || null,
+        running: true,
+        bg: isBgWorker,
+      });
+    }
+    if (jobId) {
+      const j = loadJob(mainSid, peerId, jobId);
+      if (j) saveJob(mainSid, peerId, { ...j, peerSessionId: sid, childPid, workerPid: isBgWorker ? process.pid : j.workerPid });
+    }
+  };
+
+  const cmd = backend === 'claude' ? 'claude' : 'grok';
+  let res = await runCmd(cmd, run.args, stamp(run.sid));
+  if (superseded()) process.exit(0);
+
+  if (res.code !== 0 && existing && !isolated) {
+    lastMarker = buildDigest(lead, null).lastMarker;
+    const fresh = mkNew();
+    const retry = await runCmd(cmd, fresh.args, stamp(fresh.sid));
+    if (superseded()) process.exit(0);
+    if (retry.code === 0) { run = fresh; res = retry; }
+  }
+
+  if (res.code !== 0) {
+    const err = (res.err || res.out || '').trim().slice(0, 500);
+    if (!isolated) {
+      const finalErr = loadState(mainSid, peerId);
+      if (finalErr.token === myToken) {
+        saveState(mainSid, peerId, {
+          ...finalErr,
+          running: false,
+          childPid: null,
+          bgPid: null,
+          lastError: err,
+          lastFinishedAt: new Date().toISOString(),
+        });
+      }
+    }
+    if (jobId) {
+      const j = loadJob(mainSid, peerId, jobId);
+      if (j) saveJob(mainSid, peerId, { ...j, status: 'failed', error: err, finishedAt: new Date().toISOString() });
+    }
+    fail(`co-agent failed (exit ${res.code}, backend=${backend}, peer=${peerId}): ${err}`);
+  }
+
+  const parsed = parsePeerResult(backend, res.out);
+  if (parsed.sessionId) run.sid = parsed.sessionId;
+  if (superseded()) process.exit(0);
+
+  const status = parsed.subtype
+    ? (parsed.isError ? `⚠ ${parsed.subtype}` : parsed.subtype)
+    : (parsed.isError ? '⚠ error' : null);
+  const dur = parsed.durMs != null ? `${(parsed.durMs / 1000).toFixed(1)}s` : null;
+  const tpath = findPeerTranscript(backend, run.sid);
+  const meta = [
+    `peer=${peerId}`,
+    `lead=${lead.harness}`,
+    `model=${formatModelSpec(backend, model) || backend}`,
+    jobId && `job=${jobId}`,
+    status,
+    parsed.stopReason,
+    dur,
+    dig.hardFallback && `fallback:${dig.fallbackNote}`,
+    tpath && `transcript: ${tpath}`,
+  ].filter(Boolean).join(' · ');
+
+  writeReplyFiles(mainSid, peerId, {
+    answer: parsed.answer,
+    meta,
+    message,
+    backend,
+    peerSessionId: run.sid,
+    jobId,
+  });
+
+  if (!isolated) {
+    const final = loadState(mainSid, peerId);
+    if (final.token === myToken) {
+      saveState(mainSid, peerId, {
+        ...final,
+        sessionId: run.sid,
+        lastUuid: lastMarker || dig.lastMarker || final.lastUuid || null,
+        childPid: null,
+        bgPid: null,
+        backend,
+        lead: lead.harness,
+        pin: lead.pin || null,
+        running: false,
+        bg: false,
+        lastFinishedAt: new Date().toISOString(),
+        lastError: null,
+        lastMeta: meta,
+        currentJobId: null,
+      });
+    }
+  }
+
+  if (jobId) {
+    const j = loadJob(mainSid, peerId, jobId);
+    if (j && j.status === 'running') {
+      saveJob(mainSid, peerId, {
+        ...j,
+        status: 'done',
+        peerSessionId: run.sid,
+        childPid: null,
+        workerPid: null,
+        finishedAt: new Date().toISOString(),
+        meta,
+      });
+    }
+  }
+
+  console.log(parsed.answer);
+  if (meta) console.log(`\n↳ ${meta}`);
+  console.log(`↳ peer: ${peerId}`);
+  console.log(`↳ reply: ${lastReplyPath(mainSid, peerId)}`);
+  if (jobId) console.log(`↳ job: ${jobId}`);
+}
+
+// ─── bg / join / jobs ───────────────────────────────────────────────────────
+
+function cmdBg(message, cli) {
+  const ctx = resolveContext(cli);
+  const { lead, backend, peerId, model, modelSpec } = ctx;
+  const mainSid = lead.sessionId;
+  const state = loadState(mainSid, peerId);
+  const parallel = !!cli.parallel;
+
+  const runningJobs = listJobs(mainSid, peerId).filter(isJobAlive);
+  const mainRunning = isRunAlive(state);
+
+  // Only block same-peer non-parallel; other peers may run freely
+  if (!parallel && (mainRunning || runningJobs.length)) {
+    fail(
+      `peer ${peerId} already running` +
+      `${mainRunning ? ' (main thread)' : ''}` +
+      `${runningJobs.length ? ` jobs=${runningJobs.map((j) => j.id).join(',')}` : ''}. ` +
+      `join, use --parallel, or foreground coagent --peer ${peerId} "…" to take over this peer.`,
+    );
+  }
+
+  const jobId = newJobId();
+  const useIsolated = !!parallel;
+
+  saveJob(mainSid, peerId, {
+    id: jobId,
+    status: 'running',
+    message,
+    backend,
+    peerId,
+    model: model || null,
+    isolated: useIsolated,
+    startedAt: new Date().toISOString(),
+    workerPid: null,
+    childPid: null,
+  });
+
+  const args = [];
+  if (cli.lead) args.push('--lead', cli.lead);
+  if (cli.modelSpec) args.push('--model', cli.modelSpec);
+  else if (model) args.push('--model', formatModelSpec(backend, model));
+  else if (backend) args.push('--model', backend);
+  if (cli.persona) args.push('--persona', cli.persona);
+  args.push('--peer', peerId);
+  args.push(message);
+
+  const logFile = jobLogPath(mainSid, peerId, jobId);
+  const outFd = fs.openSync(logFile, 'w');
+  const childEnv = {
+    ...process.env,
+    COAGENT_BG_WORKER: '1',
+    COAGENT_JOB_ID: jobId,
+    COAGENT_ISOLATED: useIsolated ? '1' : '0',
+    COAGENT_PEER: peerId,
+    COAGENT_LEAD_SESSION_ID: lead.sessionId,
+    ...(lead.harness === 'grok' ? { GROK_SESSION_ID: lead.sessionId } : {}),
+    ...(lead.harness === 'claude' ? { CLAUDE_CODE_SESSION_ID: lead.sessionId } : {}),
+    COAGENT_LEAD: lead.harness,
+    COAGENT_MODEL: (cli.modelSpec
+      || formatModelSpec(backend, model)
+      || backend),
+  };
+
+  const child = spawn(process.execPath, [__filename, ...args], {
+    cwd: process.cwd(),
+    env: childEnv,
+    detached: true,
+    stdio: ['ignore', outFd, outFd],
+  });
+  fs.closeSync(outFd);
+  child.unref();
+
+  saveJob(mainSid, peerId, {
+    ...loadJob(mainSid, peerId, jobId),
+    workerPid: child.pid,
+  });
+
+  if (!useIsolated) {
+    saveState(mainSid, peerId, {
+      ...state,
+      peerId,
+      running: true,
+      bg: true,
+      bgPid: child.pid,
+      childPid: null,
+      lastQuestion: message,
+      lastQuestionAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      lastFinishedAt: null,
+      lastError: null,
+      backend,
+      lead: lead.harness,
+      pin: lead.pin || null,
+      currentJobId: jobId,
+    });
+  }
+
+  console.log(`co-agent: job ${jobId} started on peer ${peerId}${useIsolated ? ' (parallel/isolated)' : ''}`);
+  console.log(`  lead=${lead.harness} ${lead.sessionId}`);
+  console.log(`  model=${formatModelSpec(backend, model) || backend}`);
+  console.log(`  worker=${child.pid}`);
+  console.log(`  log=${logFile}`);
+  console.log(`  reply→ ${jobReplyPath(mainSid, peerId, jobId)}`);
+  console.log(`  join: coagent join ${jobId}`);
+}
+
+async function cmdJoin(cli, jobIdArg, timeoutSec) {
+  const { lead } = resolveContext(cli);
+  const mainSid = lead.sessionId;
+  const timeoutMs = (timeoutSec != null ? timeoutSec : 600) * 1000;
+  const start = Date.now();
+  const raw = !!cli.raw;
+  const preferredPeer = cli.peer && cli.peer !== 'new' ? cli.peer : (process.env.COAGENT_PEER || null);
+
+  let jobId = jobIdArg || null;
+  let peerId = preferredPeer;
+
+  if (!jobId) {
+    const jobs = preferredPeer
+      ? listJobs(mainSid, preferredPeer).map((j) => ({ ...j, peerId: preferredPeer }))
+      : listAllJobs(mainSid);
+    const running = jobs.find(isJobAlive);
+    const pick = running || jobs[0];
+    if (pick) {
+      jobId = pick.id;
+      peerId = pick.peerId;
+    }
+  }
+
+  if (!jobId) {
+    // Fallback last_reply on preferred or main
+    const p = preferredPeer || DEFAULT_PEER;
+    if (fs.existsSync(lastReplyMetaPath(mainSid, p))) {
+      const meta = JSON.parse(fs.readFileSync(lastReplyMetaPath(mainSid, p), 'utf8'));
+      if (raw) process.stdout.write((meta.answer || meta.answerPreview || '') + '\n');
+      else if (fs.existsSync(lastReplyPath(mainSid, p))) {
+        process.stdout.write(fs.readFileSync(lastReplyPath(mainSid, p), 'utf8'));
+      }
+      return;
+    }
+    fail('no jobs to join (start with: coagent bg "…")');
+  }
+
+  if (!peerId) {
+    const found = findJob(mainSid, jobId, preferredPeer);
+    if (!found) fail(`unknown job id: ${jobId}`);
+    peerId = found.peerId;
+  }
+
+  const printDone = (job) => {
+    if (raw) {
+      let answer = null;
+      if (fs.existsSync(lastReplyMetaPath(mainSid, peerId))) {
+        try {
+          const m = JSON.parse(fs.readFileSync(lastReplyMetaPath(mainSid, peerId), 'utf8'));
+          if (m.jobId === jobId && m.answer) answer = m.answer;
+        } catch { /* */ }
+      }
+      if (!answer && fs.existsSync(jobReplyPath(mainSid, peerId, jobId))) {
+        const wrapped = fs.readFileSync(jobReplyPath(mainSid, peerId, jobId), 'utf8');
+        const parts = wrapped.split(/\n\n/);
+        if (parts.length >= 2) {
+          answer = parts.slice(1).join('\n\n').replace(/\n---\n[\s\S]*$/, '').trim();
+        } else answer = wrapped;
+      }
+      process.stdout.write((answer || job.answer || '') + (String(answer || '').endsWith('\n') ? '' : '\n'));
+      return;
+    }
+    const rp = jobReplyPath(mainSid, peerId, jobId);
+    if (fs.existsSync(rp)) process.stdout.write(fs.readFileSync(rp, 'utf8'));
+    else if (fs.existsSync(lastReplyPath(mainSid, peerId))) {
+      process.stdout.write(fs.readFileSync(lastReplyPath(mainSid, peerId), 'utf8'));
+    } else console.log('(no reply body)');
+  };
+
+  {
+    const j = loadJob(mainSid, peerId, jobId);
+    if (!j) fail(`unknown job id: ${jobId} (peer ${peerId})`);
+    if ((j.status === 'done' || j.status === 'failed' || j.status === 'superseded') && !isJobAlive(j)) {
+      if (j.status === 'failed') fail(`job ${jobId} failed: ${j.error || 'unknown'}`);
+      if (j.status === 'superseded') fail(`job ${jobId} was superseded`);
+      printDone(j);
+      return;
+    }
+    if (!isJobAlive(j) && j.status === 'running') {
+      saveJob(mainSid, peerId, { ...j, status: 'failed', error: 'stale (process gone)' });
+      fail(`job ${jobId} failed: stale (process gone)`);
+    }
+  }
+
+  if (!isJobAlive(loadJob(mainSid, peerId, jobId))) {
+    fail(`job ${jobId} is not running (status=${(loadJob(mainSid, peerId, jobId) || {}).status})`);
+  }
+
+  while (Date.now() - start < timeoutMs) {
+    const j = loadJob(mainSid, peerId, jobId);
+    if (!j) fail(`job ${jobId} disappeared`);
+    if (j.status === 'done') { printDone(j); return; }
+    if (j.status === 'failed') fail(`job ${jobId} failed: ${j.error || 'unknown'}`);
+    if (j.status === 'superseded') fail(`job ${jobId} was superseded`);
+    if (!isJobAlive(j) && j.status === 'running') {
+      await sleep(300);
+      const j2 = loadJob(mainSid, peerId, jobId);
+      if (j2 && j2.status === 'done') { printDone(j2); return; }
+      fail(`job ${jobId} ended without reply`);
+    }
+    await sleep(400);
+  }
+  fail(`join timed out after ${timeoutSec || 600}s for job ${jobId}`);
+}
+
+function cmdJobs(cli) {
+  const { lead } = resolveContext(cli, { allowMint: false });
+  const preferred = cli.peer && cli.peer !== 'new' ? cli.peer : null;
+  const jobs = preferred
+    ? listJobs(lead.sessionId, preferred).map((j) => ({ ...j, peerId: preferred }))
+    : listAllJobs(lead.sessionId);
+  if (!jobs.length) { console.log('no jobs'); return; }
+  for (const j of jobs) {
+    const alive = isJobAlive(j);
+    console.log(
+      `${j.id}  peer=${j.peerId || '?'}  ${alive ? 'RUNNING' : j.status}` +
+      `${j.isolated ? ' parallel' : ''}` +
+      `${j.backend ? ` ${j.backend}` : ''}` +
+      `  ${ageLabel(j.startedAt) || ''}` +
+      `  ${(j.message || '').slice(0, 50)}`,
+    );
+  }
+}
+
+function cmdPeers(cli) {
+  const { lead } = resolveContext(cli, { allowMint: false });
+  const ids = listPeerIds(lead.sessionId);
+  if (!ids.length) {
+    console.log('no peers yet (send a message to create main)');
+    return;
+  }
+  for (const id of ids) {
+    const s = loadState(lead.sessionId, id);
+    const run = isRunAlive(s);
+    const liveJobs = listJobs(lead.sessionId, id).filter(isJobAlive).length;
+    console.log(
+      `${id}` +
+      `  ${run ? 'RUNNING' : 'idle'}` +
+      `${peerModelLabel(s) ? `  model=${peerModelLabel(s)}` : ''}` +
+      `${s.personaPath && s.personaPath !== PERSONA_FILE ? `  persona=${path.basename(s.personaPath)}` : ''}` +
+      `${liveJobs ? `  jobs=${liveJobs}` : ''}` +
+      `${s.lastQuestionAt ? `  last=${ageLabel(s.lastQuestionAt)}` : ''}` +
+      `${s.sessionId ? `  session=${String(s.sessionId).slice(0, 8)}…` : '  (no session yet)'}`,
+    );
+  }
+}
+
+function cmdStatus(cli) {
+  const ctx = resolveContext(cli, { allowMint: false });
+  const { lead, backend, leadChoice, backendChoice, peerId, model } = ctx;
+  let s = loadState(lead.sessionId, peerId);
+  if (s.running && !isRunAlive(s) && (s.childPid || s.bgPid)) {
+    saveState(lead.sessionId, peerId, {
+      ...s, running: false, childPid: null, bgPid: null,
+      lastError: s.lastError || 'run marked stale (process gone)',
+    });
+    s = loadState(lead.sessionId, peerId);
+  }
+  const running = isRunAlive(s);
+  const peers = listPeerIds(lead.sessionId);
+  const allLive = listAllJobs(lead.sessionId).filter(isJobAlive);
+
+  console.log(`co-agent: lead=${lead.harness} (${lead.sessionId}) · pin=${lead.pin || '?'}`);
+  console.log(`  peer: ${peerId}${ctx.modelSpec ? ` · model=${ctx.modelSpec}` : (model ? ` · model=${model}` : '')}`);
+  console.log(`  backend=${backend} [lead:${leadChoice}, backend:${backendChoice}]`);
+  console.log(`  thread: ${s.sessionId || '(none)'}${s.backend ? ` · peer-backend=${s.backend}` : ''}`);
+  const runBits = [];
+  if (running) {
+    runBits.push('RUNNING');
+    if (s.bg) runBits.push('bg');
+    if (s.childPid) runBits.push(`peer-proc=${s.childPid}`);
+    if (s.bgPid) runBits.push(`worker=${s.bgPid}`);
+    if (s.currentJobId) runBits.push(`job=${s.currentJobId}`);
+  } else runBits.push('idle');
+  console.log(
+    `  run: ${runBits.join(' ')}` +
+    `${running && s.startedAt ? ` · started ${ageLabel(s.startedAt)}` : ''}` +
+    `${!running && s.lastFinishedAt ? ` · last finish ${ageLabel(s.lastFinishedAt)}` : ''}`,
+  );
+  console.log(`  peers: ${peers.length ? peers.join(', ') : '(none)'}`);
+  if (allLive.length) {
+    console.log(`  live jobs: ${allLive.map((j) => `${j.id}@${j.peerId}`).join(', ')}`);
+  }
+  if (s.lastQuestion) {
+    console.log(`  last ask (${ageLabel(s.lastQuestionAt) || '?'}): ${clip(s.lastQuestion, 160)}`);
+  }
+  if (s.lastError) console.log(`  last error: ${clip(s.lastError, 200)}`);
+  if (s.lastMeta && !running) console.log(`  last meta: ${s.lastMeta}`);
+  console.log(`  lead transcript: ${lead.transcriptPath}`);
+  if (s.sessionId) {
+    const tp = findPeerTranscript(s.backend || backend, s.sessionId);
+    if (tp) console.log(`  peer transcript: ${tp}`);
+  }
+  if (fs.existsSync(lastReplyPath(lead.sessionId, peerId))) {
+    console.log(`  last reply: ${lastReplyPath(lead.sessionId, peerId)} (${ageLabel(fs.statSync(lastReplyPath(lead.sessionId, peerId)).mtimeMs)})`);
+  }
+  const boxEntries = listOutbox(lead.sessionId, peerId);
+  console.log(`  outbox: ${outboxDir(lead.sessionId, peerId)} (${boxEntries.length} file${boxEntries.length === 1 ? '' : 's'})`);
+  for (const e of boxEntries.slice(0, 5)) console.log(`    - ${e.name} (${ageLabel(e.mtimeMs)})`);
+  if (boxEntries.length > 5) console.log(`    … +${boxEntries.length - 5} more`);
+  console.log(`  state: ${statePath(lead.sessionId, peerId)}`);
+}
+
+async function cmdReset(cli) {
+  const { lead, peerId } = resolveContext(cli);
+  const all = cli.rest && cli.rest.includes('--all');
+  // parse --all from process - use env or check: reset [--all] [--peer x]
+  const resetAll = process.argv.includes('--all');
+
+  const targets = resetAll ? listPeerIds(lead.sessionId) : [peerId];
+  if (!targets.length) targets.push(DEFAULT_PEER);
+
+  for (const pid of targets) {
+    const s = loadState(lead.sessionId, pid);
+    for (const p of [s.childPid, s.bgPid]) {
+      if (p && isAlive(p)) await killTree(p);
+    }
+    for (const j of listJobs(lead.sessionId, pid)) {
+      if (isJobAlive(j)) {
+        if (j.childPid) await killTree(j.childPid);
+        if (j.workerPid) await killTree(j.workerPid);
+      }
+    }
+    // Keep sticky config, clear session thread
+    const sticky = {
+      peerId: pid,
+      createdAt: s.createdAt || new Date().toISOString(),
+      backend: s.backend || null,
+      backendChoice: s.backendChoice || null,
+      model: s.model || null,
+      personaPath: s.personaPath || null,
+      resetAt: new Date().toISOString(),
+    };
+    saveState(lead.sessionId, pid, sticky);
+    console.log(`co-agent: peer ${pid} thread reset (sticky config kept)`);
+  }
+}
+
+async function cmdRm(cli) {
+  const { lead, peerId } = resolveContext(cli);
+  if (peerId === DEFAULT_PEER && !process.argv.includes('--force')) {
+    fail('refusing to rm peer "main" without --force (use reset to clear thread)');
+  }
+  const s = loadState(lead.sessionId, peerId);
+  for (const p of [s.childPid, s.bgPid]) {
+    if (p && isAlive(p)) await killTree(p);
+  }
+  for (const j of listJobs(lead.sessionId, peerId)) {
+    if (isJobAlive(j)) {
+      if (j.childPid) await killTree(j.childPid);
+      if (j.workerPid) await killTree(j.workerPid);
+    }
+  }
+  const dir = peerDir(lead.sessionId, peerId);
+  fs.rmSync(dir, { recursive: true, force: true });
+  console.log(`co-agent: removed peer ${peerId}`);
+  console.log(`  ${dir}`);
+}
+
+function cmdLead(cli) {
+  const { lead, backend, leadChoice, backendChoice, peerId, model } = resolveContext(cli, { allowMint: false });
+  console.log(JSON.stringify({
+    lead: lead.harness,
+    leadSessionId: lead.sessionId,
+    leadTranscript: lead.transcriptPath,
+    pin: lead.pin || null,
+    peerId,
+    model: model || null,
+    grokSessionEnv: process.env.GROK_SESSION_ID || null,
+    backend,
+    leadChoice,
+    backendChoice,
+  }, null, 2));
+}
+
+function cmdDigest(cli) {
+  const { lead, backend, peerId } = resolveContext(cli, { allowMint: false });
+  const state = loadState(lead.sessionId, peerId);
+  const dig = buildDigest(lead, state.lastUuid || null);
+  console.log(`lead=${lead.harness} backend=${backend} peer=${peerId} pin=${lead.pin || '?'}`);
+  console.log(`digest: ${dig.digestPath}`);
+  console.log(`json: ${dig.jsonPath}`);
+  console.log(`lastMarker: ${dig.lastMarker}`);
+  console.log(`delta: ${dig.isDelta}${dig.fallbackNote ? ` · fallback: ${dig.fallbackNote}` : ''}`);
+  console.log(`outbox index (all peers): ${(dig.side.outbox || []).length} files`);
+  console.log(`thread: ${state.sessionId || '(none)'}`);
+  const text = fs.readFileSync(dig.digestPath, 'utf8');
+  const lines = text.split('\n');
+  console.log('--- digest preview ---');
+  console.log(lines.slice(0, 50).join('\n'));
+  if (lines.length > 50) console.log(`… (${lines.length - 50} more lines, ${text.length} chars)`);
+}
+
+function cmdTranscript(cli) {
+  const { lead, backend, peerId } = resolveContext(cli, { allowMint: false });
+  const state = loadState(lead.sessionId, peerId);
+  const p = findPeerTranscript(state.backend || backend, state.sessionId);
+  if (!p) fail(`no co-agent transcript yet for peer ${peerId}`);
+  console.log(p);
+}
+
+function cmdOutbox(cli, args) {
+  const { lead, peerId } = resolveContext(cli, { allowMint: false });
+  const sub = (args[0] || 'list').toLowerCase();
+  const dir = outboxDir(lead.sessionId, peerId);
+  if (sub === 'path' || sub === 'dir') { console.log(dir); return; }
+  if (sub === 'list' || sub === 'ls') {
+    console.log(`outbox (peer ${peerId}): ${dir}`);
+    console.log(formatOutboxListing(listOutbox(lead.sessionId, peerId)));
+    return;
+  }
+  if (sub === 'cat' || sub === 'show' || sub === 'read') {
+    const name = args[1];
+    if (!name) fail('usage: coagent outbox cat <file>');
+    const p = path.join(dir, path.basename(name));
+    if (!fs.existsSync(p)) fail(`no outbox file: ${path.basename(name)}`);
+    const body = fs.readFileSync(p, 'utf8');
+    process.stdout.write(body);
+    if (!body.endsWith('\n')) console.log('');
+    return;
+  }
+  const p = path.join(dir, path.basename(sub));
+  if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+    process.stdout.write(fs.readFileSync(p, 'utf8'));
+    return;
+  }
+  fail(`unknown outbox subcommand "${sub}" (list | path | cat <file>)`);
+}
+
+function cmdDoctor(cli) {
+  const defaultPersona = loadPersona(PERSONA_FILE);
+  console.log('coagent doctor');
+  console.log(`  home: ${ROOT}`);
+  console.log(`  binary: ${__filename}`);
+  console.log(`  persona: ${PERSONA_FILE} (${fs.existsSync(PERSONA_FILE) ? 'ok' : 'MISSING'})`);
+  console.log(`  digest lib: ${path.join(ROOT, 'lib', 'digest.js')} (${fs.existsSync(path.join(ROOT, 'lib', 'digest.js')) ? 'ok' : 'MISSING'})`);
+  console.log(`  claude cli: ${whichBin('claude') || 'NOT FOUND'}`);
+  console.log(`  grok cli: ${whichBin('grok') || 'NOT FOUND'}`);
+  console.log(`  env GROK_AGENT: ${process.env.GROK_AGENT || '(unset)'}`);
+  console.log(`  env (pre-resolve) GROK_SESSION_ID: ${process.env.GROK_SESSION_ID || '(unset)'}`);
+  try {
+    const { lead, backend, leadChoice, backendChoice, peerId, model } = resolveContext(cli || {}, { allowMint: false });
+    console.log(`  lead: ${lead.harness} ${lead.sessionId}`);
+    console.log(`  pin: ${lead.pin}`);
+    console.log(`  peer: ${peerId}${model ? ` model=${model}` : ''}`);
+    console.log(`  peers: ${listPeerIds(lead.sessionId).join(', ') || '(none)'}`);
+    console.log(`  backend: ${backend} [lead:${leadChoice}, backend:${backendChoice}]`);
+    const s = loadState(lead.sessionId, peerId);
+    console.log(`  peer session: ${s.sessionId || '(none)'}`);
+    console.log(`  running: ${isRunAlive(s)}`);
+    console.log(`  last error: ${s.lastError || '(none)'}`);
+    console.log(`  outbox files: ${listOutbox(lead.sessionId, peerId).length}`);
+    console.log(`  jobs (all peers): ${listAllJobs(lead.sessionId).length}`);
+    console.log(`  persona effort: ${defaultPersona.effort}`);
+  } catch (e) {
+    console.log(`  lead resolve: FAIL — ${e.message || e}`);
+  }
+}
+
+async function cmdWatch(cli, intervalSec) {
+  const { lead, backend, peerId } = resolveContext(cli);
+  let state = loadState(lead.sessionId, peerId);
+  let b = state.backend || backend;
+  let p = findPeerTranscript(b, state.sessionId);
+  const interval = Math.max(0.2, intervalSec || 1) * 1000;
+  const follow = !!cli.follow;
+  const deadline = cli.timeoutSec != null && cli.timeoutSec > 0
+    ? Date.now() + cli.timeoutSec * 1000
+    : null;
+
+  if (!p && !follow) {
+    console.log(`co-agent: no thread/transcript yet for peer ${peerId}`);
+    return;
+  }
+
+  let offset = 0;
+  if (p && fs.existsSync(p)) offset = fs.statSync(p).size;
+
+  console.log(`watching peer ${peerId} · ${p || '(waiting for transcript)'} · follow=${follow}`);
+
+  while (true) {
+    if (deadline && Date.now() > deadline) return;
+    state = loadState(lead.sessionId, peerId);
+    b = state.backend || backend;
+    p = findPeerTranscript(b, state.sessionId);
+    if (p && fs.existsSync(p)) {
+      const { lines, size } = peerEventsSince(b, p, offset);
+      for (const ln of lines) console.log(ln);
+      offset = size;
+    }
+    if (!follow && !isRunAlive(state) && !listJobs(lead.sessionId, peerId).some(isJobAlive)) {
+      if (p && fs.existsSync(p)) {
+        const { lines, size } = peerEventsSince(b, p, offset);
+        for (const ln of lines) console.log(ln);
+        offset = size;
+      }
+      console.log(`\n_(run finished · reply: ${lastReplyPath(lead.sessionId, peerId)})_`);
+      return;
+    }
+    await sleep(interval);
+  }
+}
+
+function peerEventsSince(backend, transcriptPath, sinceByte) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return { lines: [], size: 0 };
+  const st = fs.statSync(transcriptPath);
+  const size = st.size;
+  if (sinceByte >= size) return { lines: [], size };
+  const fd = fs.openSync(transcriptPath, 'r');
+  try {
+    const len = size - sinceByte;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, sinceByte);
+    let chunk = buf.toString('utf8');
+    if (sinceByte > 0 && !chunk.startsWith('\n') && chunk.includes('\n')) {
+      chunk = chunk.slice(chunk.indexOf('\n') + 1);
+    }
+    const lines = [];
+    for (const line of chunk.split('\n').filter(Boolean)) {
+      let rec; try { rec = JSON.parse(line); } catch { continue; }
+      if (backend === 'claude') {
+        if (rec.isSidechain) continue;
+        const c = rec.message && rec.message.content;
+        if (rec.type === 'assistant' && Array.isArray(c)) {
+          for (const part of c) {
+            if (part.type === 'text' && part.text) lines.push(`● ${clip(digestLib.stripNoise(part.text), 200)}`);
+            else if (part.type === 'tool_use') {
+              lines.push(`  ↳ ${part.name}${digestLib.summarizeToolInput(part.input, HOME)}`);
+            }
+          }
+        }
+      } else if (rec.method === 'session/update') {
+        const u = (rec.params && rec.params.update) || {};
+        const kind = u.sessionUpdate;
+        if (kind === 'agent_message_chunk') {
+          const t = digestLib.stripNoise(digestLib.textFromContent(u.content));
+          if (t) lines.push(`● ${clip(t, 200)}`);
+        } else if (kind === 'tool_call') {
+          const name = (u._meta && u._meta['x.ai/tool'] && u._meta['x.ai/tool'].name) || u.title || 'tool';
+          lines.push(`  ↳ ${name}${digestLib.summarizeToolInput(u.rawInput || {}, HOME)}`);
+        } else if (kind === 'tool_call_update' && (u.status === 'completed' || u.status === 'failed')) {
+          const t = digestLib.stripNoise(digestLib.textFromContent(u.content));
+          if (t) lines.push(`      → ${clip(t, 160)}`);
+        }
+      }
+    }
+    return { lines, size };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
+async function main() {
+  const parsed = parseArgs(process.argv.slice(2));
+  if (parsed.help) { printHelp(); return; }
+  const cli = {
+    lead: parsed.lead,
+    peer: parsed.peer,
+    modelSpec: parsed.modelSpec,
+    persona: parsed.persona,
+    save: parsed.save,
+    follow: parsed.follow,
+    raw: parsed.raw,
+    parallel: parsed.parallel,
+    timeoutSec: parsed.timeoutSec,
+  };
+  const rest = parsed.rest;
+  const verb = rest[0];
+
+  const verbs = new Set([
+    'status', 'reset', 'rm', 'peers', 'lead', 'digest', 'transcript',
+    'outbox', 'watch', 'bg', 'join', 'jobs', 'doctor',
+  ]);
+  if (process.env.COAGENT_BG_WORKER === '1' && rest.length && !verbs.has(verb)) {
+    const jobId = process.env.COAGENT_JOB_ID || null;
+    const isolated = process.env.COAGENT_ISOLATED === '1';
+    if (process.env.COAGENT_PEER && cli.peer == null) cli.peer = process.env.COAGENT_PEER;
+    await talk(rest.join(' '), cli, { background: true, jobId, isolated });
+    return;
+  }
+
+  if (!verb) fail('usage: coagent [options] "<message>" | bg | join | peers | …  (try --help)');
+
+  if (verb === 'status') return cmdStatus(cli);
+  if (verb === 'peers') return cmdPeers(cli);
+  if (verb === 'reset') return await cmdReset(cli);
+  if (verb === 'rm') return await cmdRm(cli);
+  if (verb === 'lead') return cmdLead(cli);
+  if (verb === 'digest') return cmdDigest(cli);
+  if (verb === 'transcript') return cmdTranscript(cli);
+  if (verb === 'doctor') return cmdDoctor(cli);
+  if (verb === 'jobs') return cmdJobs(cli);
+  if (verb === 'outbox') return cmdOutbox(cli, rest.slice(1));
+  if (verb === 'watch') {
+    let interval;
+    for (const a of rest.slice(1)) {
+      if (!Number.isNaN(Number(a))) { interval = Number(a); break; }
+    }
+    return cmdWatch(cli, interval);
+  }
+  if (verb === 'bg') {
+    const msgParts = rest.slice(1);
+    const filtered = msgParts.filter((a) => a !== '--parallel');
+    const msg = filtered.join(' ');
+    if (!msg) fail('usage: coagent bg [--parallel] [--peer …] "<message>"');
+    return cmdBg(msg, cli);
+  }
+  if (verb === 'join') {
+    let jobId = null;
+    let timeout = 600;
+    for (const a of rest.slice(1)) {
+      if (a === '--raw') { cli.raw = true; continue; }
+      if (/^[0-9a-f]{6,12}$/i.test(a) && jobId == null) { jobId = a; continue; }
+      if (!Number.isNaN(Number(a))) { timeout = Number(a); continue; }
+    }
+    return cmdJoin(cli, jobId, timeout);
+  }
+
+  await talk(rest.join(' '), cli, { background: false });
+}
+
+if (require.main === module) {
+  main().catch((e) => fail(e && e.stack ? e.stack : String(e)));
+}
+
+module.exports = {
+  buildDigest,
+  resolveLead,
+  digestLib,
+  resolvePeerId,
+  listPeerIds,
+};

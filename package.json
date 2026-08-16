@@ -1,0 +1,13 @@
+{
+  "name": "coagent",
+  "version": "1.0.0",
+  "description": "Harness-agnostic peer agents for Claude Code and Grok Build",
+  "bin": {
+    "coagent": "./bin/coagent"
+  },
+  "scripts": {
+    "test": "node test/digest.test.js"
+  },
+  "license": "MIT",
+  "private": true
+}
