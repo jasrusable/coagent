@@ -1,22 +1,15 @@
 #!/usr/bin/env node
 'use strict';
 
-// coagent — multi-peer agent for Claude Code or Grok Build.
+// coagent — the lead's standing colleague (Claude Code or Grok Build).
 //
-// Stack: human → lead agent → coagent peer(s)
-//
-// Peers: default "main", or --peer <uuid>|new. Each peer has its own session,
-// state, outbox, and jobs. Digest of the lead conversation is shared.
+// Stack: human → lead agent → one co-agent per lead session
 //
 // Usage:
-//   coagent [opts] "<message>"                 foreground (peer main, or --peer)
-//   coagent [opts] bg [--parallel] "<msg>"     background job → prints job id
-//   coagent [opts] join [jobId] [--raw] [sec]  wait for job
-//   coagent [opts] jobs | peers | status | reset | rm | lead | digest | transcript | doctor
-//   coagent [opts] watch [-f] [--timeout N] [interval_s]
-//   coagent [opts] outbox [list|path|cat <file>]
-//
-// Options: --peer, --lead, --model backend[/id], --persona, --save, --raw, --parallel, …
+//   coagent [opts] "<message>"        enqueue on the standing thread, wait
+//   coagent [opts] --interrupt "…"    stop the current turn, do this next
+//   coagent status | watch | reset | sessions | resume <id> | log | search
+//   coagent digest | lead | transcript | doctor | outbox
 
 const fs = require('fs');
 const os = require('os');
@@ -24,10 +17,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 
-const digestLib = require(path.join(os.homedir(), '.coagent', 'lib', 'digest.js'));
-
 const HOME = os.homedir();
-const ROOT = path.join(HOME, '.coagent');
+const ROOT = process.env.COAGENT_HOME || path.join(HOME, '.coagent');
 const PERSONA_FILE = path.join(ROOT, 'persona.md');
 const PERSONAS_DIR = path.join(ROOT, 'personas');
 const STATE_DIR = path.join(ROOT, 'state');
@@ -36,7 +27,14 @@ const GROK_HOME = process.env.GROK_HOME || path.join(HOME, '.grok');
 const GROK_SESSIONS = path.join(GROK_HOME, 'sessions');
 const GROK_ACTIVE = path.join(GROK_HOME, 'active_sessions.json');
 const VALID = new Set(['auto', 'claude', 'grok']);
-const DEFAULT_PEER = 'main';
+
+function loadLib(name) {
+  const installed = path.join(ROOT, 'lib', name);
+  if (fs.existsSync(installed)) return require(installed);
+  return require(path.join(__dirname, '..', 'lib', name));
+}
+const digestLib = loadLib('digest.js');
+const S = loadLib('session.js');
 
 const INHERITANCE_PREAMBLE = [
   'You inherit the lead agent\'s full instruction stack (global CLAUDE.md / AGENTS.md and any',
@@ -47,17 +45,16 @@ const INHERITANCE_PREAMBLE = [
   'no co-agent of your own to consult, so do not act on those directions. You are the peer',
   'being referred to; just be that peer.',
   '',
-  'You are a full peer agent for the lead — same kind of capability surface, standing thread,',
-  'shared tree. Handle whatever the lead needs. Lead with the bottom line; be direct; no filler.',
+  'You are the lead\'s standing colleague — one thread, same workspace. Lead with the bottom',
+  'line; be direct; no filler.',
   '',
   'Outbox: for durable work products (long reviews, checklists, findings, plans), write files',
-  'under the outbox directory you are given. Clear names (review.md, …). Chat reply = short',
-  'summary + full path(s). Short answers can stay chat-only.',
+  'under the outbox directory you are given. Chat reply = short summary + full path(s).',
 ].join(' ');
 
 const fail = (msg) => { console.error(`coagent: ${msg}`); process.exit(1); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const isAlive = S.isAlive;
 
 function childPidsOf(pid) {
   try {
@@ -84,186 +81,38 @@ async function killTree(pid) {
   for (const p of all.reverse()) {
     if (isAlive(p)) { try { process.kill(p, 'SIGKILL'); } catch { /* */ } }
   }
-  for (let i = 0; i < 20; i++) { if (!all.some(isAlive)) break; await sleep(50); }
 }
 
-function atomicWrite(p, data) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, p);
-}
-function ensureDir(d) { fs.mkdirSync(d, { recursive: true }); }
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
-// ─── paths (lead + peer) ────────────────────────────────────────────────────
+const digestMdPath = (leadSid) => path.join(S.leadDir(STATE_DIR, leadSid), 'context.md');
+const digestJsonPath = (leadSid) => path.join(S.leadDir(STATE_DIR, leadSid), 'context.json');
 
-function leadDir(leadSid) { const d = path.join(STATE_DIR, leadSid); ensureDir(d); return d; }
-function peersRoot(leadSid) { const d = path.join(leadDir(leadSid), 'peers'); ensureDir(d); return d; }
-function peerDir(leadSid, peerId) {
-  const id = peerId || DEFAULT_PEER;
-  const d = path.join(peersRoot(leadSid), id);
-  ensureDir(d);
+function outboxDir(leadSid, genId, create = true) {
+  const d = path.join(S.genDir(STATE_DIR, leadSid, genId, create), 'outbox');
+  if (create) S.ensureDir(d);
   return d;
 }
 
-const digestMdPath = (leadSid) => path.join(leadDir(leadSid), 'context.md');
-const digestJsonPath = (leadSid) => path.join(leadDir(leadSid), 'context.json');
-
-const statePath = (leadSid, peerId) => path.join(peerDir(leadSid, peerId), 'state.json');
-const lastReplyPath = (leadSid, peerId) => path.join(peerDir(leadSid, peerId), 'last_reply.md');
-const lastReplyMetaPath = (leadSid, peerId) => path.join(peerDir(leadSid, peerId), 'last_reply.json');
-function jobsDir(leadSid, peerId) {
-  const d = path.join(peerDir(leadSid, peerId), 'jobs');
-  ensureDir(d);
-  return d;
+function lastReplyPath(leadSid, genId) {
+  return path.join(S.genDir(STATE_DIR, leadSid, genId, false), 'last_reply.md');
 }
-const jobPath = (leadSid, peerId, jobId) => path.join(jobsDir(leadSid, peerId), `${jobId}.json`);
-const jobReplyPath = (leadSid, peerId, jobId) => path.join(jobsDir(leadSid, peerId), `${jobId}.reply.md`);
-const jobLogPath = (leadSid, peerId, jobId) => path.join(jobsDir(leadSid, peerId), `${jobId}.log`);
-function outboxDir(leadSid, peerId) {
-  const d = path.join(peerDir(leadSid, peerId), 'outbox');
-  ensureDir(d);
-  return d;
+function lastReplyMetaPath(leadSid, genId) {
+  return path.join(S.genDir(STATE_DIR, leadSid, genId, false), 'last_reply.json');
 }
 
-function migratePeersLayout(leadSid) {
-  // Old: state/<lead>/state.json, outbox/, jobs/, last_reply.*
-  // New: state/<lead>/peers/<peerId>/{state,outbox,jobs,last_reply.*}
-  // Digest stays at state/<lead>/context.*
-  const legacyFlat = path.join(STATE_DIR, `${leadSid}.json`);
-  const ld = leadDir(leadSid);
-  if (fs.existsSync(legacyFlat)) {
-    const dest = path.join(ld, 'state.json');
-    if (!fs.existsSync(dest)) {
-      try { fs.renameSync(legacyFlat, dest); } catch {
-        try { fs.copyFileSync(legacyFlat, dest); } catch { /* */ }
-      }
-    }
-  }
-
-  const mainD = peerDir(leadSid, DEFAULT_PEER);
-  const oldState = path.join(ld, 'state.json');
-  const newState = statePath(leadSid, DEFAULT_PEER);
-  if (fs.existsSync(oldState) && !fs.existsSync(newState)) {
-    try { fs.renameSync(oldState, newState); } catch {
-      try { fs.copyFileSync(oldState, newState); } catch { /* */ }
-    }
-  }
-  for (const name of ['outbox', 'jobs']) {
-    const oldD = path.join(ld, name);
-    const newD = path.join(mainD, name);
-    if (fs.existsSync(oldD) && !fs.existsSync(newD)) {
-      try { fs.renameSync(oldD, newD); } catch { /* */ }
-    }
-  }
-  for (const name of ['last_reply.md', 'last_reply.json', 'bg.log']) {
-    const oldP = path.join(ld, name);
-    const newP = path.join(mainD, name);
-    if (fs.existsSync(oldP) && !fs.existsSync(newP)) {
-      try { fs.renameSync(oldP, newP); } catch { /* */ }
-    }
-  }
-}
-
-function listPeerIds(leadSid) {
-  migratePeersLayout(leadSid);
-  const root = peersRoot(leadSid);
-  if (!fs.existsSync(root)) return [];
-  return fs.readdirSync(root).filter((n) => {
-    if (n.startsWith('.')) return false;
-    try { return fs.statSync(path.join(root, n)).isDirectory(); } catch { return false; }
-  }).sort((a, b) => {
-    if (a === DEFAULT_PEER) return -1;
-    if (b === DEFAULT_PEER) return 1;
-    return a.localeCompare(b);
-  });
-}
-
-function loadState(leadSid, peerId) {
-  migratePeersLayout(leadSid);
-  const p = statePath(leadSid, peerId);
-  if (!fs.existsSync(p)) return {};
-  try {
-    const s = JSON.parse(fs.readFileSync(p, 'utf8'));
-    return normalizePeerState(s, peerId);
-  } catch { return {}; }
-}
-const saveState = (leadSid, peerId, s) =>
-  atomicWrite(statePath(leadSid, peerId), JSON.stringify(s, null, 2));
-
-function loadJob(leadSid, peerId, jobId) {
-  const p = jobPath(leadSid, peerId, jobId);
-  if (!fs.existsSync(p)) return null;
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
-}
-const saveJob = (leadSid, peerId, job) =>
-  atomicWrite(jobPath(leadSid, peerId, job.id), JSON.stringify(job, null, 2));
-
-function listJobs(leadSid, peerId) {
-  const dir = jobsDir(leadSid, peerId);
-  const out = [];
-  for (const f of fs.readdirSync(dir)) {
-    if (!f.endsWith('.json')) continue;
-    try { out.push(JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))); } catch { /* */ }
-  }
-  out.sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
-  return out;
-}
-
-function listAllJobs(leadSid) {
-  const out = [];
-  for (const peerId of listPeerIds(leadSid)) {
-    for (const j of listJobs(leadSid, peerId)) {
-      out.push({ ...j, peerId });
-    }
-  }
-  out.sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
-  return out;
-}
-
-function findJob(leadSid, jobId, preferredPeer) {
-  if (preferredPeer) {
-    const j = loadJob(leadSid, preferredPeer, jobId);
-    if (j) return { job: j, peerId: preferredPeer };
-  }
-  for (const peerId of listPeerIds(leadSid)) {
-    const j = loadJob(leadSid, peerId, jobId);
-    if (j) return { job: j, peerId };
-  }
-  return null;
-}
-
-function newJobId() {
-  return crypto.randomBytes(4).toString('hex');
-}
-
-function listOutbox(leadSid, peerId) {
-  const dir = outboxDir(leadSid, peerId);
+function listOutbox(leadSid, genId) {
+  const dir = outboxDir(leadSid, genId, false);
+  if (!fs.existsSync(dir)) return [];
   const entries = [];
   for (const name of fs.readdirSync(dir)) {
     if (name.startsWith('.')) continue;
     const p = path.join(dir, name);
     let st; try { st = fs.statSync(p); } catch { continue; }
     if (!st.isFile()) continue;
-    entries.push({ name, path: p, size: st.size, mtimeMs: st.mtimeMs, mtime: st.mtime.toISOString(), peerId });
+    entries.push({ name, path: p, size: st.size, mtimeMs: st.mtimeMs, mtime: st.mtime.toISOString() });
   }
   entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return entries;
-}
-
-function allOutboxIndex(leadSid) {
-  const entries = [];
-  for (const peerId of listPeerIds(leadSid)) {
-    for (const e of listOutbox(leadSid, peerId)) {
-      entries.push({
-        name: `${peerId}/${e.name}`,
-        size: e.size,
-        mtime: e.mtime,
-        path: e.path,
-      });
-    }
-  }
   return entries;
 }
 
@@ -290,42 +139,36 @@ function clip(s, n) {
   return digestLib.clip(s, n, HOME);
 }
 
-// ─── args ───────────────────────────────────────────────────────────────────
-
 function printHelp() {
-  console.log(`coagent — multi-peer agent for Claude Code or Grok Build
+  console.log(`coagent — the lead's standing colleague (one per harness session)
 
 Usage:
-  coagent [opts] "<message>"                 foreground (default peer: main)
-  coagent [opts] bg [--parallel] "<msg>"     background job → prints job id
-  coagent [opts] join [jobId] [--raw] [sec]  wait for job (default: latest; 600s)
-  coagent [opts] jobs                        list jobs (all peers)
-  coagent [opts] peers                       list peers
-  coagent [opts] status | reset | rm | lead | digest | transcript | doctor
-  coagent [opts] watch [-f|--follow] [--timeout N] [interval_s]
-  coagent [opts] outbox [list|path|cat <file>]
-
-Peers:
-  (no --peer)            use peer "main" (created on first message)
-  --peer <uuid>          resume that peer, or create with that id
-  --peer new             mint a new uuid peer, print id, continue
+  coagent [opts] "<message>"              enqueue, wait for this reply (resumes)
+  coagent [opts] --interrupt "<message>"  stop the current turn, do this next
+  coagent status                          current gen, queue, last reply
+  coagent watch [-f] [--timeout N]        live tail of the colleague
+  coagent reset                           archive this gen, start a fresh transcript
+  coagent sessions                        list generations
+  coagent resume <id>                     make an old gen current
+  coagent log                             consults in the current gen
+  coagent search "<query>"                search this session's generations
+  coagent digest | lead | transcript | doctor | outbox
 
 Options:
   --lead, -l    auto|claude|grok
-  --model, -m   <spec>             backend or backend/modelId (e.g. claude, claude/opus, grok)
-                                   sticky on create; call override unless --save
-  --persona     <name|path>        sticky on create; call override unless --save
-  --save                           persist --model/--persona on peer
-  --raw                            join: print answer body only
-  --parallel                       bg: isolated peer session (safe concurrent on same peer)
-  --follow, -f                     watch: stream
-  --timeout N                      watch: exit after N seconds (0 = none)
+  --model, -m   <spec>     this-turn override (claude, grok, grok-4.6, claude/opus, …)
+                           default: the lead's current model
+  --persona     <name|path>
+  --clear-queue            with --interrupt: drop remaining queued items
+  --raw                    print answer body only
+  --timeout N              wait N seconds (default 600)
+  --follow, -f             watch: keep following
   --help, -h
 
-  ( --backend is rejected — use --model claude/… or --model grok/… )
+  (--peer / ask / --backend are rejected)
 
-Env: COAGENT_MODEL (claude or claude/opus), COAGENT_LEAD, COAGENT_PERSONA,
-     COAGENT_PEER, COAGENT_LEAD_TRANSCRIPT, COAGENT_LEAD_SESSION_ID,
+Env: COAGENT_HOME, COAGENT_MODEL, COAGENT_LEAD, COAGENT_PERSONA,
+     COAGENT_LEAD_TRANSCRIPT, COAGENT_LEAD_SESSION_ID,
      GROK_SESSION_ID, CLAUDE_CODE_SESSION_ID
 Home: ${ROOT}
 `);
@@ -333,44 +176,42 @@ Home: ${ROOT}
 
 function parseArgs(argv) {
   let lead = null;
-  let peer = null; // null = main; 'new' = mint; string = id
-  let modelSpec = null; // "claude" | "claude/opus" | "grok" | "grok/<id>"
+  let modelSpec = null;
   let persona = null;
-  let save = false;
   let follow = false;
   let raw = false;
-  let parallel = false;
+  let interrupt = false;
+  let clearQueue = false;
   let timeoutSec = null;
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') return { help: true };
     if (a === '--backend' || a === '-b' || a.startsWith('--backend=')) {
-      fail('use --model backend[/modelId] instead of --backend (e.g. --model claude/opus)');
+      fail('use --model instead of --backend (e.g. --model grok-4.6 or --model claude)');
+    }
+    if (a === '--peer' || a.startsWith('--peer=')) {
+      fail('one co-agent per lead session. Resume: coagent "…". Fresh tape: coagent reset');
     }
     if (a === '--lead' || a === '-l') { lead = argv[++i]; continue; }
     if (a.startsWith('--lead=')) { lead = a.slice(7); continue; }
-    if (a === '--peer') {
-      const n = argv[i + 1];
-      if (n && !n.startsWith('-')) { peer = argv[++i]; }
-      else { peer = 'new'; }
-      continue;
-    }
-    if (a.startsWith('--peer=')) { peer = a.slice(7) || 'new'; continue; }
     if (a === '--model' || a === '-m') { modelSpec = argv[++i]; continue; }
     if (a.startsWith('--model=')) { modelSpec = a.slice(8); continue; }
     if (a === '--persona') { persona = argv[++i]; continue; }
     if (a.startsWith('--persona=')) { persona = a.slice(10); continue; }
-    if (a === '--save') { save = true; continue; }
+    if (a === '--interrupt') { interrupt = true; continue; }
+    if (a === '--clear-queue') { clearQueue = true; continue; }
     if (a === '--follow' || a === '-f') { follow = true; continue; }
     if (a === '--raw') { raw = true; continue; }
-    if (a === '--parallel') { parallel = true; continue; }
     if (a === '--timeout') { timeoutSec = Number(argv[++i]); continue; }
     if (a.startsWith('--timeout=')) { timeoutSec = Number(a.slice(10)); continue; }
+    if (a === '--parallel' || a === '--save') {
+      fail(`${a} is gone. Messages resume the standing thread; --model/--persona apply to this turn`);
+    }
     if (a.startsWith('-') && a !== '-') fail(`unknown option ${a} (try --help)`);
     rest.push(a);
   }
-  return { lead, peer, modelSpec, persona, save, follow, raw, parallel, timeoutSec, rest };
+  return { lead, modelSpec, persona, follow, raw, interrupt, clearQueue, timeoutSec, rest };
 }
 
 function normalizeChoice(v, label) {
@@ -380,7 +221,7 @@ function normalizeChoice(v, label) {
   return n;
 }
 
-/** @returns {{ backendChoice: string, modelId: string|null, raw: string|null }} */
+/** backend/id, harness name, or a raw model id (grok-4.6, claude-opus-…). */
 function parseModelSpec(spec) {
   if (spec == null || spec === '') {
     return { backendChoice: null, modelId: null, raw: null };
@@ -393,9 +234,7 @@ function parseModelSpec(spec) {
     const be = s.slice(0, i).trim();
     const modelId = s.slice(i + 1).trim() || null;
     const backendChoice = normalizeChoice(be, '--model backend');
-    if (backendChoice === 'auto') {
-      fail('--model auto/… is not valid; use claude/… or grok/…');
-    }
+    if (backendChoice === 'auto') fail('--model auto/… is not valid; use claude/… or grok/…');
     if (!modelId) fail(`--model ${s}: missing model id after /`);
     return { backendChoice, modelId, raw: s };
   }
@@ -404,51 +243,9 @@ function parseModelSpec(spec) {
   if (VALID.has(lower)) {
     return { backendChoice: normalizeChoice(s, '--model'), modelId: null, raw: s };
   }
-  fail(
-    `--model must be "claude", "grok", "auto", or "backend/modelId" ` +
-    `(e.g. claude/opus, grok/…). Got: ${s}`,
-  );
-}
-
-function formatModelSpec(backendChoice, modelId) {
-  if (!backendChoice || backendChoice === 'auto') {
-    return modelId || null;
-  }
-  return modelId ? `${backendChoice}/${modelId}` : backendChoice;
-}
-
-function normalizePeerState(s, peerId) {
-  if (!s || typeof s !== 'object') return {};
-  const next = { ...s, peerId: s.peerId || peerId };
-  if (!next.modelSpec) {
-    const be = (next.backendChoice && next.backendChoice !== 'auto')
-      ? next.backendChoice
-      : (next.backend || null);
-    next.modelSpec = formatModelSpec(be, next.model || null) || be || null;
-  }
-  return next;
-}
-
-function peerModelLabel(s) {
-  if (!s) return null;
-  if (s.modelSpec) return s.modelSpec;
-  const be = (s.backendChoice && s.backendChoice !== 'auto') ? s.backendChoice : (s.backend || null);
-  return formatModelSpec(be, s.model || null) || be || null;
-}
-
-function resolvePeerId(cli, { allowMint = true } = {}) {
-  const fromEnv = process.env.COAGENT_PEER || null;
-  let raw = cli.peer != null ? cli.peer : fromEnv;
-  if (raw == null || raw === '' || raw === DEFAULT_PEER) {
-    return { peerId: DEFAULT_PEER, minted: false };
-  }
-  if (raw === 'new' || raw === 'NEW') {
-    if (!allowMint) {
-      fail('--peer new only applies when sending a message (fg/bg), not list/status commands');
-    }
-    return { peerId: crypto.randomUUID(), minted: true };
-  }
-  return { peerId: String(raw).trim(), minted: false };
+  const backendChoice = lower.startsWith('claude') ? 'claude'
+    : (lower.startsWith('grok') ? 'grok' : null);
+  return { backendChoice, modelId: s, raw: s };
 }
 
 function resolvePersonaPath(flagOrSticky) {
@@ -458,7 +255,6 @@ function resolvePersonaPath(flagOrSticky) {
   if (v.startsWith('/') || v.startsWith('~') || v.includes('/')) {
     return v.startsWith('~') ? path.join(HOME, v.slice(1)) : v;
   }
-  // name → ~/.coagent/personas/<name>.md or <name>
   const candidates = [
     path.join(PERSONAS_DIR, `${v}.md`),
     path.join(PERSONAS_DIR, v),
@@ -488,7 +284,6 @@ function loadPersona(personaPath) {
   return {
     path: p,
     effort: meta.effort || 'high',
-    // model in frontmatter is deprecated; still accepted as fallback
     model: meta.model || null,
     backend: meta.backend || null,
     lead: meta.lead || null,
@@ -499,8 +294,6 @@ function loadPersona(personaPath) {
     persona: body.trim(),
   };
 }
-
-// ─── process / lead resolution ──────────────────────────────────────────────
 
 function ancestorPids() {
   const out = [];
@@ -527,24 +320,29 @@ function findClaudeTranscriptBySid(sid) {
   return null;
 }
 
+function claudeProjectDirForCwd(cwd) {
+  if (!cwd || !fs.existsSync(CLAUDE_PROJECTS)) return null;
+  const slug = cwd.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const exact = path.join(CLAUDE_PROJECTS, slug);
+  if (fs.existsSync(exact)) return exact;
+  const dashed = cwd.replace(/^\//, '').replace(/\//g, '-');
+  const p = path.join(CLAUDE_PROJECTS, dashed);
+  if (fs.existsSync(p)) return p;
+  return null;
+}
+
 function findClaudeTranscriptByCwd() {
-  if (!fs.existsSync(CLAUDE_PROJECTS)) return null;
-  const cwd = process.cwd();
+  const dir = claudeProjectDirForCwd(process.cwd());
+  if (!dir) return null;
   let best = null;
   let bestM = 0;
-  for (const d of fs.readdirSync(CLAUDE_PROJECTS)) {
-    const dir = path.join(CLAUDE_PROJECTS, d);
-    let st;
-    try { st = fs.statSync(dir); } catch { continue; }
-    if (!st.isDirectory()) continue;
-    for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith('.jsonl')) continue;
-      const t = path.join(dir, f);
-      try {
-        const m = fs.statSync(t).mtimeMs;
-        if (m > bestM) { bestM = m; best = t; }
-      } catch { /* */ }
-    }
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith('.jsonl')) continue;
+    const t = path.join(dir, f);
+    try {
+      const m = fs.statSync(t).mtimeMs;
+      if (m > bestM) { bestM = m; best = t; }
+    } catch { /* */ }
   }
   return best;
 }
@@ -613,13 +411,13 @@ function resolveGrokLead(explicitSid) {
   if (envSid) {
     const dir = grokSessionDir(envSid, process.cwd()) || grokSessionDir(envSid);
     if (dir) {
-      const transcriptPath = path.join(dir, 'updates.jsonl');
       injectGrokSessionEnv(envSid);
       return {
         harness: 'grok',
         sessionId: envSid,
-        transcriptPath,
+        transcriptPath: path.join(dir, 'updates.jsonl'),
         pin: process.env.GROK_SESSION_ID === envSid ? 'env' : 'coagent-env',
+        sessionDir: dir,
       };
     }
   }
@@ -629,7 +427,7 @@ function resolveGrokLead(explicitSid) {
   const byAncestor = active
     .filter((s) => s && s.session_id && s.pid && ancestors.has(s.pid) && isAlive(s.pid));
   if (byAncestor.length > 1) {
-    fail(`ambiguous Grok lead: ${byAncestor.length} sessions in ancestry. Set GROK_SESSION_ID.`);
+    fail(`ambiguous Grok lead: ${byAncestor.length} sessions in ancestry`);
   }
   if (byAncestor.length === 1) {
     const s = byAncestor[0];
@@ -641,6 +439,7 @@ function resolveGrokLead(explicitSid) {
         sessionId: s.session_id,
         transcriptPath: path.join(dir, 'updates.jsonl'),
         pin: 'ancestor-pid',
+        sessionDir: dir,
       };
     }
   }
@@ -649,7 +448,7 @@ function resolveGrokLead(explicitSid) {
   const byCwd = active
     .filter((s) => s && s.session_id && s.cwd && chain.includes(s.cwd) && (!s.pid || isAlive(s.pid)));
   if (byCwd.length > 1) {
-    fail(`ambiguous Grok lead: ${byCwd.length} active sessions for this cwd. Set GROK_SESSION_ID.`);
+    fail(`ambiguous Grok lead: ${byCwd.length} active sessions for this cwd`);
   }
   if (byCwd.length === 1) {
     const s = byCwd[0];
@@ -661,26 +460,9 @@ function resolveGrokLead(explicitSid) {
         sessionId: s.session_id,
         transcriptPath: path.join(dir, 'updates.jsonl'),
         pin: 'cwd-active',
+        sessionDir: dir,
       };
     }
-  }
-
-  if (!fs.existsSync(GROK_SESSIONS)) return null;
-  let best = null;
-  let bestM = 0;
-  for (const cwd of chain) {
-    const group = path.join(GROK_SESSIONS, encodeGrokCwd(cwd));
-    if (!fs.existsSync(group)) continue;
-    for (const sid of fs.readdirSync(group)) {
-      const t = path.join(group, sid, 'updates.jsonl');
-      if (!fs.existsSync(t)) continue;
-      const m = fs.statSync(t).mtimeMs;
-      if (m > bestM) { bestM = m; best = { sessionId: sid, transcriptPath: t }; }
-    }
-  }
-  if (best) {
-    injectGrokSessionEnv(best.sessionId);
-    return { harness: 'grok', sessionId: best.sessionId, transcriptPath: best.transcriptPath, pin: 'cwd-mtime' };
   }
   return null;
 }
@@ -690,7 +472,13 @@ function leadFromExplicitTranscript(transcriptPath) {
   if (transcriptPath.includes(`${path.sep}updates.jsonl`) || transcriptPath.endsWith('updates.jsonl')) {
     const sessionId = path.basename(path.dirname(transcriptPath));
     injectGrokSessionEnv(sessionId);
-    return { harness: 'grok', sessionId, transcriptPath, pin: 'explicit-path' };
+    return {
+      harness: 'grok',
+      sessionId,
+      transcriptPath,
+      pin: 'explicit-path',
+      sessionDir: path.dirname(transcriptPath),
+    };
   }
   if (transcriptPath.endsWith('.jsonl')) {
     return {
@@ -737,14 +525,8 @@ function resolveLead(leadChoice) {
     const c = resolveClaudeLead(null);
     if (c) return c;
   }
-  fail('no lead conversation found. Set COAGENT_LEAD_TRANSCRIPT / GROK_SESSION_ID / CLAUDE_CODE_SESSION_ID.');
+  fail('no lead conversation found. Need GROK_SESSION_ID or CLAUDE_CODE_SESSION_ID.');
 }
-
-function resolveBackend(backendChoice, leadHarness) {
-  return backendChoice === 'auto' ? leadHarness : backendChoice;
-}
-
-// ─── digest ─────────────────────────────────────────────────────────────────
 
 function loadClaudeRecords(transcriptPath) {
   if (!transcriptPath || !fs.existsSync(transcriptPath)) return [];
@@ -763,7 +545,6 @@ function loadGrokUpdates(transcriptPath) {
     if (!line.trim()) continue;
     try {
       const o = JSON.parse(line);
-      // Primary stream + occasional x.ai-prefixed variants
       if (o.method !== 'session/update' && o.method !== '_x.ai/session/update') continue;
       const params = o.params || {};
       const meta = params._meta || {};
@@ -778,7 +559,15 @@ function loadGrokUpdates(transcriptPath) {
   return out;
 }
 
-function buildDigest(lead, sinceMarker) {
+function detectLeadModel(lead) {
+  if (lead.harness === 'grok') {
+    const dir = lead.sessionDir || grokSessionDir(lead.sessionId, process.cwd()) || grokSessionDir(lead.sessionId);
+    return S.detectGrokLeadModel(dir);
+  }
+  return S.detectClaudeLeadModel(loadClaudeRecords(lead.transcriptPath));
+}
+
+function buildDigest(lead, genId, sinceMarker) {
   const records = lead.harness === 'claude'
     ? loadClaudeRecords(lead.transcriptPath)
     : loadGrokUpdates(lead.transcriptPath);
@@ -788,19 +577,22 @@ function buildDigest(lead, sinceMarker) {
     records,
     sinceMarker,
     home: HOME,
-    outboxIndex: allOutboxIndex(lead.sessionId),
+    outboxIndex: listOutbox(lead.sessionId, genId).map((e) => ({
+      name: e.name, size: e.size, mtime: e.mtime, path: e.path,
+    })),
     transcriptPath: lead.transcriptPath,
     pin: lead.pin || null,
   });
 
   const digestPath = digestMdPath(lead.sessionId);
   const jsonPath = digestJsonPath(lead.sessionId);
-  atomicWrite(digestPath, result.markdown);
-  atomicWrite(jsonPath, JSON.stringify({
+  S.atomicWrite(digestPath, result.markdown);
+  S.writeJson(jsonPath, {
     lead: lead.harness,
     sessionId: lead.sessionId,
     pin: lead.pin || null,
     transcriptPath: lead.transcriptPath,
+    genId,
     isDelta: result.isDelta,
     lastMarker: result.lastMarker,
     sinceMarker: sinceMarker || null,
@@ -808,7 +600,7 @@ function buildDigest(lead, sinceMarker) {
     snapshot: result.side,
     outbox: result.side.outbox || [],
     updatedAt: new Date().toISOString(),
-  }, null, 2));
+  });
 
   return {
     digestPath,
@@ -821,14 +613,16 @@ function buildDigest(lead, sinceMarker) {
   };
 }
 
-// ─── peer runtimes ──────────────────────────────────────────────────────────
-
 function runCmd(cmd, args, onSpawn) {
   return new Promise((resolve) => {
     const childEnv = { ...process.env };
     delete childEnv.GROK_AGENT;
     delete childEnv.COAGENT_BG_WORKER;
-    const child = spawn(cmd, args, { cwd: process.cwd(), env: childEnv });
+    const child = spawn(cmd, args, {
+      cwd: process.cwd(),
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     if (onSpawn) onSpawn(child.pid);
     let out = '';
     let err = '';
@@ -855,7 +649,6 @@ function parsePeerResult(backend, out) {
       durMs = j.duration_ms || null;
       stopReason = j.stop_reason || null;
     } else {
-      // grok json: { text, sessionId, stopReason, usage, ... }
       let text = j.result || j.answer || j.text || null;
       if (!text && j.message) {
         text = typeof j.message === 'string' ? j.message
@@ -908,8 +701,6 @@ function buildGrokArgs({ prompt, effort, model, permissionMode, allowedTools, di
   return [...base, '--session-id', sessionId];
 }
 
-function newPeerSessionId() { return crypto.randomUUID(); }
-
 function findPeerTranscript(backend, peerSessionId) {
   if (!peerSessionId) return null;
   if (backend === 'claude') {
@@ -929,15 +720,15 @@ function whichBin(name) {
   } catch { return null; }
 }
 
-function writeReplyFiles(leadSid, peerId, { answer, meta, message, backend, peerSessionId, jobId }) {
+function writeReplyFiles(leadSid, genId, { answer, meta, message, backend, peerSessionId, itemId }) {
   const header = [
     `# Co-agent reply`,
     ``,
     `**When:** ${new Date().toISOString()}`,
-    `**Peer:** ${peerId}`,
+    `**Generation:** ${genId}`,
     `**Backend:** ${backend}`,
-    peerSessionId ? `**Peer session:** ${peerSessionId}` : '',
-    jobId ? `**Job:** ${jobId}` : '',
+    peerSessionId ? `**Session:** ${peerSessionId}` : '',
+    itemId ? `**Item:** ${itemId}` : '',
     message ? `**Asked:** ${clip(message, 300)}` : '',
     ``,
     answer,
@@ -945,127 +736,57 @@ function writeReplyFiles(leadSid, peerId, { answer, meta, message, backend, peer
     meta ? `---\n_${meta}_` : '',
   ].filter(Boolean).join('\n');
 
-  atomicWrite(lastReplyPath(leadSid, peerId), header);
-  atomicWrite(lastReplyMetaPath(leadSid, peerId), JSON.stringify({
+  S.atomicWrite(lastReplyPath(leadSid, genId), header);
+  S.writeJson(lastReplyMetaPath(leadSid, genId), {
     at: new Date().toISOString(),
-    peerId,
+    genId,
     backend,
     peerSessionId: peerSessionId || null,
-    jobId: jobId || null,
+    itemId: itemId || null,
     message: message || null,
     answer,
     answerPreview: clip(answer, 400),
     meta: meta || null,
-  }, null, 2));
-
-  if (jobId) {
-    atomicWrite(jobReplyPath(leadSid, peerId, jobId), header);
-  }
+  });
   return { body: answer, wrapped: header };
 }
 
-function isRunAlive(s) {
-  return !!(s.running && (
-    (s.childPid && isAlive(s.childPid)) ||
-    (s.bgPid && isAlive(s.bgPid))
-  ));
-}
-
-function isJobAlive(job) {
-  if (!job || job.status !== 'running') return false;
-  return !!(
-    (job.childPid && isAlive(job.childPid)) ||
-    (job.workerPid && isAlive(job.workerPid))
-  );
-}
-
-// ─── context / talk ─────────────────────────────────────────────────────────
-
-function resolveContext(cli, opts = {}) {
-  const { peerId, minted } = resolvePeerId(cli, opts);
+function resolveContext(cli) {
   const defaultPersona = loadPersona(PERSONA_FILE);
-
   const leadChoice = normalizeChoice(cli.lead ?? process.env.COAGENT_LEAD ?? defaultPersona.lead, 'lead');
   const lead = resolveLead(leadChoice);
-  migratePeersLayout(lead.sessionId);
+  const genId = S.ensureCurrent(STATE_DIR, lead.sessionId);
+  const meta = S.loadMeta(STATE_DIR, lead.sessionId, genId);
 
-  let state = loadState(lead.sessionId, peerId);
-  const isNew = !state.createdAt && !state.sessionId;
-
-  // Persona path: call flag → sticky → default
   const personaPath = resolvePersonaPath(
-    cli.persona || process.env.COAGENT_PERSONA || state.personaPath || null,
+    cli.persona || process.env.COAGENT_PERSONA || meta.personaPath || null,
   );
   const persona = loadPersona(personaPath);
-
-  // Combined model spec: call → env → sticky → persona → auto
-  // Spec form: "claude" | "grok" | "auto" | "claude/<modelId>" | "grok/<modelId>"
+  const leadModel = detectLeadModel(lead);
   const callSpec = parseModelSpec(cli.modelSpec ?? process.env.COAGENT_MODEL ?? null);
-  const stickySpec = {
-    backendChoice: state.backendChoice || null,
-    modelId: state.model || null,
-  };
-  const personaBe = persona.backend ? normalizeChoice(persona.backend, 'persona backend') : null;
 
   let backendChoice = callSpec.backendChoice
-    || stickySpec.backendChoice
-    || personaBe
+    || (persona.backend ? normalizeChoice(persona.backend, 'persona backend') : null)
     || 'auto';
   backendChoice = normalizeChoice(backendChoice, 'backend');
-  const backend = resolveBackend(backendChoice, lead.harness);
+  const backend = backendChoice === 'auto' ? lead.harness : backendChoice;
 
-  // Model id: only from explicit spec/sticky/persona frontmatter — never cross-backend
   let model = null;
   if (callSpec.raw != null) {
     model = callSpec.modelId;
-  } else if (stickySpec.modelId) {
-    model = stickySpec.modelId;
-  } else if (persona.model && backendChoice !== 'auto' && backend === (persona.backend || backend)) {
-    model = persona.model; // legacy frontmatter fallback
+  } else if (backend === lead.harness && leadModel.modelId) {
+    model = leadModel.modelId;
+  } else if (persona.model && backend === (persona.backend || backend)) {
+    model = persona.model;
   }
 
-  const modelSpecDisplay = formatModelSpec(backendChoice === 'auto' ? backend : backendChoice, model);
+  let effort = persona.effort;
+  if (!cli.modelSpec && leadModel.effort && backend === lead.harness) {
+    effort = leadModel.effort;
+  }
 
-  // Persist sticky on create or --save
-  if (isNew || minted || cli.save) {
-    const next = {
-      ...state,
-      peerId,
-      createdAt: state.createdAt || new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    if (callSpec.raw != null || isNew || minted) {
-      next.backendChoice = backendChoice;
-      next.backend = backend;
-      next.model = model;
-      next.modelSpec = modelSpecDisplay;
-    }
-    if (cli.persona || process.env.COAGENT_PERSONA || isNew || minted) {
-      next.personaPath = personaPath;
-    }
-    if (cli.save) {
-      if (callSpec.raw != null) {
-        next.backendChoice = backendChoice;
-        next.backend = backend;
-        next.model = model;
-        next.modelSpec = modelSpecDisplay;
-      }
-      if (cli.persona) next.personaPath = personaPath;
-    }
-    saveState(lead.sessionId, peerId, next);
-    state = next;
-  } else if (!state.peerId) {
-    saveState(lead.sessionId, peerId, {
-      ...state,
-      peerId,
-      createdAt: state.createdAt || new Date().toISOString(),
-      backend: state.backend || backend,
-      backendChoice: state.backendChoice || backendChoice,
-      personaPath: state.personaPath || personaPath,
-      model: state.model || model || null,
-      modelSpec: state.modelSpec || modelSpecDisplay || null,
-    });
-    state = loadState(lead.sessionId, peerId);
+  if (lead.pin === 'cwd-mtime') {
+    console.error('coagent: warning: pinned by newest transcript in this tree — may be another window');
   }
 
   return {
@@ -1073,19 +794,17 @@ function resolveContext(cli, opts = {}) {
     personaPath,
     lead,
     backend,
-    backendChoice,
-    leadChoice,
-    peerId,
-    minted,
     model,
-    modelSpec: modelSpecDisplay,
-    state,
+    effort,
+    genId,
+    meta,
+    leadModel,
   };
 }
 
-function buildPrompt({ dig, lead, backend, message, leadSid, peerId, jobId, isolated }) {
-  const box = outboxDir(leadSid, peerId);
-  const existing = listOutbox(leadSid, peerId);
+function buildPrompt({ dig, lead, backend, message, leadSid, genId }) {
+  const box = outboxDir(leadSid, genId);
+  const existing = listOutbox(leadSid, genId);
   const existingNote = existing.length
     ? [
         `Existing outbox files:`,
@@ -1094,133 +813,43 @@ function buildPrompt({ dig, lead, backend, message, leadSid, peerId, jobId, isol
     : 'Outbox is currently empty.';
 
   return [
-    `You are the lead agent's standing peer agent (full capability, shared workspace).`,
-    `Peer id: ${peerId}.`,
-    isolated ? `This is an isolated parallel job (${jobId}); you may not share memory with this peer's main thread.` : '',
+    `You are the lead agent's standing colleague (full capability, shared workspace).`,
+    `Generation: ${genId}.`,
     ``,
-    `Shared lead context (read first, every time):`,
+    `Shared lead context (user ⇄ lead — read first):`,
     `  ${dig.digestPath}`,
     dig.jsonPath ? `Structured snapshot JSON: ${dig.jsonPath}` : '',
-    `Peer state dir: ${peerDir(leadSid, peerId)}`,
     `Outbox: ${box}`,
     existingNote,
     `Write durable artifacts to the outbox. Reply: short summary + full path(s).`,
-    `Digest is full on first contact, then mostly a delta (with fallback anchors when needed).`,
     `Raw lead transcript: ${lead.transcriptPath}`,
     ``,
-    `Lead harness: ${lead.harness} (pin=${lead.pin || '?'}). Peer backend: ${backend}.`,
-    jobId ? `Job id: ${jobId}.` : '',
+    `Lead harness: ${lead.harness} (pin=${lead.pin || '?'}). Backend: ${backend}.`,
     ``,
     `The lead agent says:`,
     message,
   ].filter(Boolean).join('\n');
 }
 
-async function talk(message, cli, opts = {}) {
-  const {
-    background = false,
-    jobId = null,
-    isolated = false,
-  } = opts;
-
-  const ctx = resolveContext(cli);
-  const {
-    persona, lead, backend, peerId, minted, model,
-  } = ctx;
-  let state = loadState(lead.sessionId, peerId);
+async function runTurn(ctx, item) {
+  const { persona, lead, backend, model, effort, genId } = ctx;
   const mainSid = lead.sessionId;
+  let meta = S.loadMeta(STATE_DIR, mainSid, genId);
 
-  if (minted) {
-    console.error(`coagent: new peer ${peerId}`);
+  if (meta.sessionId && meta.backend && meta.backend !== backend) {
+    meta = { ...meta, sessionId: null, lastUuid: null };
+    S.saveMeta(STATE_DIR, mainSid, meta);
   }
 
-  // Backend change on same peer → new chat session
-  if (!isolated && state.sessionId && state.backend && state.backend !== backend) {
-    state = { ...state, sessionId: null, lastUuid: null, childPid: null };
-  }
-
-  const existing = !isolated && !!state.sessionId;
-  const myToken = crypto.randomUUID();
-  const isBgWorker = process.env.COAGENT_BG_WORKER === '1' || background;
-
-  // Kill prior runs for THIS peer only (other peers keep running)
-  const toKill = [];
-  if (!isolated) {
-    if (state.childPid && state.childPid !== process.pid) toKill.push(state.childPid);
-    if (state.bgPid && state.bgPid !== process.pid) toKill.push(state.bgPid);
-    if (!isBgWorker) {
-      for (const j of listJobs(mainSid, peerId)) {
-        if (isJobAlive(j)) {
-          if (j.childPid) toKill.push(j.childPid);
-          if (j.workerPid) toKill.push(j.workerPid);
-          saveJob(mainSid, peerId, { ...j, status: 'superseded', finishedAt: new Date().toISOString() });
-        }
-      }
-    }
-  }
-
-  if (!isolated) {
-    saveState(mainSid, peerId, {
-      ...state,
-      peerId,
-      token: myToken,
-      childPid: null,
-      bgPid: isBgWorker ? process.pid : null,
-      backend,
-      lead: lead.harness,
-      pin: lead.pin || null,
-      model: model || state.model || null,
-      personaPath: persona.path || state.personaPath || null,
-      running: true,
-      lastQuestion: message,
-      lastQuestionAt: new Date().toISOString(),
-      bg: isBgWorker,
-      startedAt: new Date().toISOString(),
-      lastFinishedAt: null,
-      lastError: null,
-      currentJobId: jobId || null,
-    });
-  }
-
-  if (jobId) {
-    const job = loadJob(mainSid, peerId, jobId) || { id: jobId };
-    saveJob(mainSid, peerId, {
-      ...job,
-      id: jobId,
-      status: 'running',
-      message,
-      backend,
-      peerId,
-      model: model || null,
-      isolated: !!isolated,
-      workerPid: isBgWorker ? process.pid : null,
-      childPid: null,
-      startedAt: job.startedAt || new Date().toISOString(),
-    });
-  }
-
-  for (const pid of [...new Set(toKill)]) {
-    if (isAlive(pid)) await killTree(pid);
-  }
-
-  const superseded = () => {
-    if (isolated && jobId) {
-      const j = loadJob(mainSid, peerId, jobId);
-      return j && j.status === 'superseded';
-    }
-    return loadState(mainSid, peerId).token !== myToken;
-  };
-
-  const dig = buildDigest(lead, existing ? state.lastUuid : null);
-  let lastMarker = dig.lastMarker;
-
+  const existing = !!meta.sessionId;
+  const dig = buildDigest(lead, genId, existing ? meta.lastUuid : null);
   const prompt = buildPrompt({
-    dig, lead, backend, message, leadSid: mainSid, peerId, jobId, isolated,
+    dig, lead, backend, message: item.message, leadSid: mainSid, genId,
   });
 
   const common = {
     prompt,
-    effort: persona.effort,
+    effort: effort || persona.effort,
     model: model || null,
     permissionMode: persona.permissionMode,
     allowedTools: persona.allowedTools,
@@ -1230,93 +859,63 @@ async function talk(message, cli, opts = {}) {
   };
 
   const mkNew = () => {
-    const sid = newPeerSessionId();
+    const sid = crypto.randomUUID();
     const args = backend === 'claude'
       ? buildClaudeArgs({ ...common, sessionId: sid, resume: false })
       : buildGrokArgs({ ...common, sessionId: sid, resume: false });
     return { sid, args };
   };
 
-  let run = (existing && !isolated)
+  let run = existing
     ? {
-        sid: state.sessionId,
+        sid: meta.sessionId,
         args: backend === 'claude'
-          ? buildClaudeArgs({ ...common, sessionId: state.sessionId, resume: true })
-          : buildGrokArgs({ ...common, sessionId: state.sessionId, resume: true }),
+          ? buildClaudeArgs({ ...common, sessionId: meta.sessionId, resume: true })
+          : buildGrokArgs({ ...common, sessionId: meta.sessionId, resume: true }),
       }
     : mkNew();
 
   const stamp = (sid) => (childPid) => {
-    if (superseded()) return;
-    if (!isolated) {
-      const s = loadState(mainSid, peerId);
-      if (s.token !== myToken) return;
-      saveState(mainSid, peerId, {
-        ...s,
-        sessionId: sid,
-        childPid,
-        bgPid: isBgWorker ? process.pid : null,
-        backend,
-        lead: lead.harness,
-        pin: lead.pin || null,
-        running: true,
-        bg: isBgWorker,
-      });
-    }
-    if (jobId) {
-      const j = loadJob(mainSid, peerId, jobId);
-      if (j) saveJob(mainSid, peerId, { ...j, peerSessionId: sid, childPid, workerPid: isBgWorker ? process.pid : j.workerPid });
-    }
+    S.writeWorker(STATE_DIR, mainSid, genId, {
+      pid: process.pid,
+      childPid,
+      itemId: item.id,
+      sessionId: sid,
+    });
   };
 
   const cmd = backend === 'claude' ? 'claude' : 'grok';
   let res = await runCmd(cmd, run.args, stamp(run.sid));
-  if (superseded()) process.exit(0);
 
-  if (res.code !== 0 && existing && !isolated) {
-    lastMarker = buildDigest(lead, null).lastMarker;
+  const latest = S.findItem(STATE_DIR, mainSid, genId, item.id);
+  if (latest && latest.status === 'interrupted') return { interrupted: true };
+
+  if (res.code !== 0 && existing) {
     const fresh = mkNew();
     const retry = await runCmd(cmd, fresh.args, stamp(fresh.sid));
-    if (superseded()) process.exit(0);
+    const again = S.findItem(STATE_DIR, mainSid, genId, item.id);
+    if (again && again.status === 'interrupted') return { interrupted: true };
     if (retry.code === 0) { run = fresh; res = retry; }
   }
 
   if (res.code !== 0) {
-    const err = (res.err || res.out || '').trim().slice(0, 500);
-    if (!isolated) {
-      const finalErr = loadState(mainSid, peerId);
-      if (finalErr.token === myToken) {
-        saveState(mainSid, peerId, {
-          ...finalErr,
-          running: false,
-          childPid: null,
-          bgPid: null,
-          lastError: err,
-          lastFinishedAt: new Date().toISOString(),
-        });
-      }
-    }
-    if (jobId) {
-      const j = loadJob(mainSid, peerId, jobId);
-      if (j) saveJob(mainSid, peerId, { ...j, status: 'failed', error: err, finishedAt: new Date().toISOString() });
-    }
-    fail(`co-agent failed (exit ${res.code}, backend=${backend}, peer=${peerId}): ${err}`);
+    const err = (res.err || res.out || '').trim().slice(0, 800);
+    return { failed: true, error: err, code: res.code };
   }
 
   const parsed = parsePeerResult(backend, res.out);
   if (parsed.sessionId) run.sid = parsed.sessionId;
-  if (superseded()) process.exit(0);
 
   const status = parsed.subtype
     ? (parsed.isError ? `⚠ ${parsed.subtype}` : parsed.subtype)
     : (parsed.isError ? '⚠ error' : null);
   const dur = parsed.durMs != null ? `${(parsed.durMs / 1000).toFixed(1)}s` : null;
   const tpath = findPeerTranscript(backend, run.sid);
-  const meta = [
-    `peer=${peerId}`,
+  const bits = [
     `lead=${lead.harness}`,
-    `model=${formatModelSpec(backend, model) || backend}`,
-    jobId && `job=${jobId}`,
+    `model=${model || backend}`,
+    `gen=${genId}`,
+    `item=${item.id}`,
     status,
     parsed.stopReason,
     dur,
@@ -1324,452 +923,270 @@ async function talk(message, cli, opts = {}) {
     tpath && `transcript: ${tpath}`,
   ].filter(Boolean).join(' · ');
 
-  writeReplyFiles(mainSid, peerId, {
+  writeReplyFiles(mainSid, genId, {
     answer: parsed.answer,
-    meta,
-    message,
+    meta: bits,
+    message: item.message,
     backend,
     peerSessionId: run.sid,
-    jobId,
+    itemId: item.id,
   });
 
-  if (!isolated) {
-    const final = loadState(mainSid, peerId);
-    if (final.token === myToken) {
-      saveState(mainSid, peerId, {
-        ...final,
-        sessionId: run.sid,
-        lastUuid: lastMarker || dig.lastMarker || final.lastUuid || null,
-        childPid: null,
-        bgPid: null,
-        backend,
-        lead: lead.harness,
-        pin: lead.pin || null,
-        running: false,
-        bg: false,
-        lastFinishedAt: new Date().toISOString(),
-        lastError: null,
-        lastMeta: meta,
-        currentJobId: null,
-      });
-    }
-  }
+  S.saveMeta(STATE_DIR, mainSid, {
+    ...S.loadMeta(STATE_DIR, mainSid, genId),
+    sessionId: run.sid,
+    lastUuid: dig.lastMarker || meta.lastUuid || null,
+    backend,
+    model: model || null,
+    lastQuestion: item.message,
+    lastQuestionAt: new Date().toISOString(),
+    lastError: null,
+    lastMeta: bits,
+    personaPath: persona.path,
+  });
 
-  if (jobId) {
-    const j = loadJob(mainSid, peerId, jobId);
-    if (j && j.status === 'running') {
-      saveJob(mainSid, peerId, {
-        ...j,
-        status: 'done',
-        peerSessionId: run.sid,
-        childPid: null,
-        workerPid: null,
-        finishedAt: new Date().toISOString(),
-        meta,
-      });
-    }
-  }
-
-  console.log(parsed.answer);
-  if (meta) console.log(`\n↳ ${meta}`);
-  console.log(`↳ peer: ${peerId}`);
-  console.log(`↳ reply: ${lastReplyPath(mainSid, peerId)}`);
-  if (jobId) console.log(`↳ job: ${jobId}`);
+  return { answer: parsed.answer, meta: bits, sessionId: run.sid };
 }
 
-// ─── bg / join / jobs ───────────────────────────────────────────────────────
-
-function cmdBg(message, cli) {
-  const ctx = resolveContext(cli);
-  const { lead, backend, peerId, model, modelSpec } = ctx;
+async function processQueue(ctx) {
+  const { lead, genId } = ctx;
   const mainSid = lead.sessionId;
-  const state = loadState(mainSid, peerId);
-  const parallel = !!cli.parallel;
-
-  const runningJobs = listJobs(mainSid, peerId).filter(isJobAlive);
-  const mainRunning = isRunAlive(state);
-
-  // Only block same-peer non-parallel; other peers may run freely
-  if (!parallel && (mainRunning || runningJobs.length)) {
-    fail(
-      `peer ${peerId} already running` +
-      `${mainRunning ? ' (main thread)' : ''}` +
-      `${runningJobs.length ? ` jobs=${runningJobs.map((j) => j.id).join(',')}` : ''}. ` +
-      `join, use --parallel, or foreground coagent --peer ${peerId} "…" to take over this peer.`,
-    );
-  }
-
-  const jobId = newJobId();
-  const useIsolated = !!parallel;
-
-  saveJob(mainSid, peerId, {
-    id: jobId,
-    status: 'running',
-    message,
-    backend,
-    peerId,
-    model: model || null,
-    isolated: useIsolated,
-    startedAt: new Date().toISOString(),
-    workerPid: null,
-    childPid: null,
-  });
-
-  const args = [];
-  if (cli.lead) args.push('--lead', cli.lead);
-  if (cli.modelSpec) args.push('--model', cli.modelSpec);
-  else if (model) args.push('--model', formatModelSpec(backend, model));
-  else if (backend) args.push('--model', backend);
-  if (cli.persona) args.push('--persona', cli.persona);
-  args.push('--peer', peerId);
-  args.push(message);
-
-  const logFile = jobLogPath(mainSid, peerId, jobId);
-  const outFd = fs.openSync(logFile, 'w');
-  const childEnv = {
-    ...process.env,
-    COAGENT_BG_WORKER: '1',
-    COAGENT_JOB_ID: jobId,
-    COAGENT_ISOLATED: useIsolated ? '1' : '0',
-    COAGENT_PEER: peerId,
-    COAGENT_LEAD_SESSION_ID: lead.sessionId,
-    ...(lead.harness === 'grok' ? { GROK_SESSION_ID: lead.sessionId } : {}),
-    ...(lead.harness === 'claude' ? { CLAUDE_CODE_SESSION_ID: lead.sessionId } : {}),
-    COAGENT_LEAD: lead.harness,
-    COAGENT_MODEL: (cli.modelSpec
-      || formatModelSpec(backend, model)
-      || backend),
-  };
-
-  const child = spawn(process.execPath, [__filename, ...args], {
-    cwd: process.cwd(),
-    env: childEnv,
-    detached: true,
-    stdio: ['ignore', outFd, outFd],
-  });
-  fs.closeSync(outFd);
-  child.unref();
-
-  saveJob(mainSid, peerId, {
-    ...loadJob(mainSid, peerId, jobId),
-    workerPid: child.pid,
-  });
-
-  if (!useIsolated) {
-    saveState(mainSid, peerId, {
-      ...state,
-      peerId,
-      running: true,
-      bg: true,
-      bgPid: child.pid,
-      childPid: null,
-      lastQuestion: message,
-      lastQuestionAt: new Date().toISOString(),
+  for (;;) {
+    const next = S.nextQueued(STATE_DIR, mainSid, genId);
+    if (!next) return;
+    S.updateItem(STATE_DIR, mainSid, genId, next.id, {
+      status: 'running',
       startedAt: new Date().toISOString(),
-      lastFinishedAt: null,
-      lastError: null,
-      backend,
-      lead: lead.harness,
-      pin: lead.pin || null,
-      currentJobId: jobId,
+    });
+    S.writeWorker(STATE_DIR, mainSid, genId, {
+      pid: process.pid,
+      childPid: null,
+      itemId: next.id,
+    });
+    const result = await runTurn(ctx, next);
+    const now = S.findItem(STATE_DIR, mainSid, genId, next.id);
+    if (now && now.status === 'interrupted') continue;
+    if (result.interrupted) continue;
+    if (result.failed) {
+      S.updateItem(STATE_DIR, mainSid, genId, next.id, {
+        status: 'failed',
+        finishedAt: new Date().toISOString(),
+        error: result.error,
+      });
+      S.saveMeta(STATE_DIR, mainSid, {
+        ...S.loadMeta(STATE_DIR, mainSid, genId),
+        lastError: result.error,
+      });
+      continue;
+    }
+    S.updateItem(STATE_DIR, mainSid, genId, next.id, {
+      status: 'done',
+      finishedAt: new Date().toISOString(),
+      error: null,
     });
   }
-
-  console.log(`co-agent: job ${jobId} started on peer ${peerId}${useIsolated ? ' (parallel/isolated)' : ''}`);
-  console.log(`  lead=${lead.harness} ${lead.sessionId}`);
-  console.log(`  model=${formatModelSpec(backend, model) || backend}`);
-  console.log(`  worker=${child.pid}`);
-  console.log(`  log=${logFile}`);
-  console.log(`  reply→ ${jobReplyPath(mainSid, peerId, jobId)}`);
-  console.log(`  join: coagent join ${jobId}`);
 }
 
-async function cmdJoin(cli, jobIdArg, timeoutSec) {
-  const { lead } = resolveContext(cli);
+async function becomeWorkerAndDrain(ctx) {
+  const { lead, genId } = ctx;
   const mainSid = lead.sessionId;
+  if (!S.tryLock(STATE_DIR, mainSid, genId, process.pid)) return false;
+  try {
+    await processQueue(ctx);
+  } finally {
+    S.releaseLock(STATE_DIR, mainSid, genId, process.pid);
+    const w = S.readWorker(STATE_DIR, mainSid, genId);
+    if (w && w.pid === process.pid) {
+      S.writeWorker(STATE_DIR, mainSid, genId, { pid: null, childPid: null, itemId: null });
+    }
+  }
+  return true;
+}
+
+async function waitForItem(leadSid, genId, itemId, timeoutSec, ctx) {
   const timeoutMs = (timeoutSec != null ? timeoutSec : 600) * 1000;
   const start = Date.now();
-  const raw = !!cli.raw;
-  const preferredPeer = cli.peer && cli.peer !== 'new' ? cli.peer : (process.env.COAGENT_PEER || null);
-
-  let jobId = jobIdArg || null;
-  let peerId = preferredPeer;
-
-  if (!jobId) {
-    const jobs = preferredPeer
-      ? listJobs(mainSid, preferredPeer).map((j) => ({ ...j, peerId: preferredPeer }))
-      : listAllJobs(mainSid);
-    const running = jobs.find(isJobAlive);
-    const pick = running || jobs[0];
-    if (pick) {
-      jobId = pick.id;
-      peerId = pick.peerId;
-    }
-  }
-
-  if (!jobId) {
-    // Fallback last_reply on preferred or main
-    const p = preferredPeer || DEFAULT_PEER;
-    if (fs.existsSync(lastReplyMetaPath(mainSid, p))) {
-      const meta = JSON.parse(fs.readFileSync(lastReplyMetaPath(mainSid, p), 'utf8'));
-      if (raw) process.stdout.write((meta.answer || meta.answerPreview || '') + '\n');
-      else if (fs.existsSync(lastReplyPath(mainSid, p))) {
-        process.stdout.write(fs.readFileSync(lastReplyPath(mainSid, p), 'utf8'));
-      }
-      return;
-    }
-    fail('no jobs to join (start with: coagent bg "…")');
-  }
-
-  if (!peerId) {
-    const found = findJob(mainSid, jobId, preferredPeer);
-    if (!found) fail(`unknown job id: ${jobId}`);
-    peerId = found.peerId;
-  }
-
-  const printDone = (job) => {
-    if (raw) {
-      let answer = null;
-      if (fs.existsSync(lastReplyMetaPath(mainSid, peerId))) {
-        try {
-          const m = JSON.parse(fs.readFileSync(lastReplyMetaPath(mainSid, peerId), 'utf8'));
-          if (m.jobId === jobId && m.answer) answer = m.answer;
-        } catch { /* */ }
-      }
-      if (!answer && fs.existsSync(jobReplyPath(mainSid, peerId, jobId))) {
-        const wrapped = fs.readFileSync(jobReplyPath(mainSid, peerId, jobId), 'utf8');
-        const parts = wrapped.split(/\n\n/);
-        if (parts.length >= 2) {
-          answer = parts.slice(1).join('\n\n').replace(/\n---\n[\s\S]*$/, '').trim();
-        } else answer = wrapped;
-      }
-      process.stdout.write((answer || job.answer || '') + (String(answer || '').endsWith('\n') ? '' : '\n'));
-      return;
-    }
-    const rp = jobReplyPath(mainSid, peerId, jobId);
-    if (fs.existsSync(rp)) process.stdout.write(fs.readFileSync(rp, 'utf8'));
-    else if (fs.existsSync(lastReplyPath(mainSid, peerId))) {
-      process.stdout.write(fs.readFileSync(lastReplyPath(mainSid, peerId), 'utf8'));
-    } else console.log('(no reply body)');
-  };
-
-  {
-    const j = loadJob(mainSid, peerId, jobId);
-    if (!j) fail(`unknown job id: ${jobId} (peer ${peerId})`);
-    if ((j.status === 'done' || j.status === 'failed' || j.status === 'superseded') && !isJobAlive(j)) {
-      if (j.status === 'failed') fail(`job ${jobId} failed: ${j.error || 'unknown'}`);
-      if (j.status === 'superseded') fail(`job ${jobId} was superseded`);
-      printDone(j);
-      return;
-    }
-    if (!isJobAlive(j) && j.status === 'running') {
-      saveJob(mainSid, peerId, { ...j, status: 'failed', error: 'stale (process gone)' });
-      fail(`job ${jobId} failed: stale (process gone)`);
-    }
-  }
-
-  if (!isJobAlive(loadJob(mainSid, peerId, jobId))) {
-    fail(`job ${jobId} is not running (status=${(loadJob(mainSid, peerId, jobId) || {}).status})`);
-  }
-
   while (Date.now() - start < timeoutMs) {
-    const j = loadJob(mainSid, peerId, jobId);
-    if (!j) fail(`job ${jobId} disappeared`);
-    if (j.status === 'done') { printDone(j); return; }
-    if (j.status === 'failed') fail(`job ${jobId} failed: ${j.error || 'unknown'}`);
-    if (j.status === 'superseded') fail(`job ${jobId} was superseded`);
-    if (!isJobAlive(j) && j.status === 'running') {
-      await sleep(300);
-      const j2 = loadJob(mainSid, peerId, jobId);
-      if (j2 && j2.status === 'done') { printDone(j2); return; }
-      fail(`job ${jobId} ended without reply`);
+    const item = S.findItem(STATE_DIR, leadSid, genId, itemId);
+    if (!item) fail(`item ${itemId} disappeared`);
+    if (item.status === 'done') return item;
+    if (item.status === 'failed') fail(`co-agent failed: ${item.error || 'unknown'}`);
+    if (item.status === 'interrupted') fail(`item ${itemId} was interrupted`);
+    if (item.status === 'queued' && !S.workerAlive(STATE_DIR, leadSid, genId) && ctx) {
+      await becomeWorkerAndDrain(ctx);
+      continue;
     }
-    await sleep(400);
+    await sleep(250);
   }
-  fail(`join timed out after ${timeoutSec || 600}s for job ${jobId}`);
+  fail(`timed out after ${timeoutSec || 600}s waiting for item ${itemId}`);
 }
 
-function cmdJobs(cli) {
-  const { lead } = resolveContext(cli, { allowMint: false });
-  const preferred = cli.peer && cli.peer !== 'new' ? cli.peer : null;
-  const jobs = preferred
-    ? listJobs(lead.sessionId, preferred).map((j) => ({ ...j, peerId: preferred }))
-    : listAllJobs(lead.sessionId);
-  if (!jobs.length) { console.log('no jobs'); return; }
-  for (const j of jobs) {
-    const alive = isJobAlive(j);
-    console.log(
-      `${j.id}  peer=${j.peerId || '?'}  ${alive ? 'RUNNING' : j.status}` +
-      `${j.isolated ? ' parallel' : ''}` +
-      `${j.backend ? ` ${j.backend}` : ''}` +
-      `  ${ageLabel(j.startedAt) || ''}` +
-      `  ${(j.message || '').slice(0, 50)}`,
-    );
-  }
+async function killCurrentChild(leadSid, genId) {
+  const w = S.readWorker(STATE_DIR, leadSid, genId);
+  if (w && w.childPid && isAlive(w.childPid)) await killTree(w.childPid);
 }
 
-function cmdPeers(cli) {
-  const { lead } = resolveContext(cli, { allowMint: false });
-  const ids = listPeerIds(lead.sessionId);
-  if (!ids.length) {
-    console.log('no peers yet (send a message to create main)');
+async function cmdSend(message, cli) {
+  const ctx = resolveContext(cli);
+  const { lead, genId } = ctx;
+  const mainSid = lead.sessionId;
+
+  if (cli.interrupt) {
+    S.interruptRunning(STATE_DIR, mainSid, genId, { clearQueue: cli.clearQueue });
+    await killCurrentChild(mainSid, genId);
+  }
+
+  const item = S.enqueue(STATE_DIR, mainSid, genId, message, { front: !!cli.interrupt });
+  if (!S.workerAlive(STATE_DIR, mainSid, genId)) {
+    await becomeWorkerAndDrain(ctx);
+  }
+  const done = await waitForItem(mainSid, genId, item.id, cli.timeoutSec, ctx);
+  const replyMeta = S.readJson(lastReplyMetaPath(mainSid, genId), {});
+  if (cli.raw) {
+    process.stdout.write((replyMeta.answer || '') + (String(replyMeta.answer || '').endsWith('\n') ? '' : '\n'));
     return;
   }
-  for (const id of ids) {
-    const s = loadState(lead.sessionId, id);
-    const run = isRunAlive(s);
-    const liveJobs = listJobs(lead.sessionId, id).filter(isJobAlive).length;
-    console.log(
-      `${id}` +
-      `  ${run ? 'RUNNING' : 'idle'}` +
-      `${peerModelLabel(s) ? `  model=${peerModelLabel(s)}` : ''}` +
-      `${s.personaPath && s.personaPath !== PERSONA_FILE ? `  persona=${path.basename(s.personaPath)}` : ''}` +
-      `${liveJobs ? `  jobs=${liveJobs}` : ''}` +
-      `${s.lastQuestionAt ? `  last=${ageLabel(s.lastQuestionAt)}` : ''}` +
-      `${s.sessionId ? `  session=${String(s.sessionId).slice(0, 8)}…` : '  (no session yet)'}`,
-    );
+  if (fs.existsSync(lastReplyPath(mainSid, genId))) {
+    const body = fs.readFileSync(lastReplyPath(mainSid, genId), 'utf8');
+    if (replyMeta.itemId === done.id || !replyMeta.itemId) {
+      process.stdout.write(body.endsWith('\n') ? body : `${body}\n`);
+    } else {
+      console.log(replyMeta.answer || '(done)');
+    }
+  } else {
+    console.log(replyMeta.answer || '(done)');
   }
+  if (replyMeta.meta) console.log(`\n↳ ${replyMeta.meta}`);
+  console.log(`↳ reply: ${lastReplyPath(mainSid, genId)}`);
 }
 
 function cmdStatus(cli) {
-  const ctx = resolveContext(cli, { allowMint: false });
-  const { lead, backend, leadChoice, backendChoice, peerId, model } = ctx;
-  let s = loadState(lead.sessionId, peerId);
-  if (s.running && !isRunAlive(s) && (s.childPid || s.bgPid)) {
-    saveState(lead.sessionId, peerId, {
-      ...s, running: false, childPid: null, bgPid: null,
-      lastError: s.lastError || 'run marked stale (process gone)',
-    });
-    s = loadState(lead.sessionId, peerId);
-  }
-  const running = isRunAlive(s);
-  const peers = listPeerIds(lead.sessionId);
-  const allLive = listAllJobs(lead.sessionId).filter(isJobAlive);
+  const ctx = resolveContext(cli);
+  const { lead, backend, model, effort, genId, meta, leadModel } = ctx;
+  const inbox = S.loadInbox(STATE_DIR, lead.sessionId, genId);
+  const live = inbox.filter((i) => i.status === 'queued' || i.status === 'running');
+  const w = S.readWorker(STATE_DIR, lead.sessionId, genId);
+  const workerOn = S.workerAlive(STATE_DIR, lead.sessionId, genId);
 
   console.log(`co-agent: lead=${lead.harness} (${lead.sessionId}) · pin=${lead.pin || '?'}`);
-  console.log(`  peer: ${peerId}${ctx.modelSpec ? ` · model=${ctx.modelSpec}` : (model ? ` · model=${model}` : '')}`);
-  console.log(`  backend=${backend} [lead:${leadChoice}, backend:${backendChoice}]`);
-  console.log(`  thread: ${s.sessionId || '(none)'}${s.backend ? ` · peer-backend=${s.backend}` : ''}`);
-  const runBits = [];
-  if (running) {
-    runBits.push('RUNNING');
-    if (s.bg) runBits.push('bg');
-    if (s.childPid) runBits.push(`peer-proc=${s.childPid}`);
-    if (s.bgPid) runBits.push(`worker=${s.bgPid}`);
-    if (s.currentJobId) runBits.push(`job=${s.currentJobId}`);
-  } else runBits.push('idle');
-  console.log(
-    `  run: ${runBits.join(' ')}` +
-    `${running && s.startedAt ? ` · started ${ageLabel(s.startedAt)}` : ''}` +
-    `${!running && s.lastFinishedAt ? ` · last finish ${ageLabel(s.lastFinishedAt)}` : ''}`,
-  );
-  console.log(`  peers: ${peers.length ? peers.join(', ') : '(none)'}`);
-  if (allLive.length) {
-    console.log(`  live jobs: ${allLive.map((j) => `${j.id}@${j.peerId}`).join(', ')}`);
+  console.log(`  generation: ${genId}${meta.archivedAt ? ' (archived?)' : ''}`);
+  console.log(`  model: ${model || '(default)'}  backend=${backend}  effort=${effort || '?'}`);
+  if (leadModel.modelId) console.log(`  lead model: ${leadModel.modelId}${leadModel.effort ? ` · effort=${leadModel.effort}` : ''}`);
+  console.log(`  thread: ${meta.sessionId || '(none)'}`);
+  console.log(`  worker: ${workerOn ? `pid=${w && w.pid}` : 'idle'}${w && w.childPid ? ` child=${w.childPid}` : ''}`);
+  if (live.length) {
+    console.log('  queue:');
+    for (const i of live) {
+      console.log(`    ${i.id}  ${i.status}  ${clip(i.message, 80)}`);
+    }
+  } else {
+    console.log('  queue: empty');
   }
-  if (s.lastQuestion) {
-    console.log(`  last ask (${ageLabel(s.lastQuestionAt) || '?'}): ${clip(s.lastQuestion, 160)}`);
+  if (meta.lastQuestion) {
+    console.log(`  last ask (${ageLabel(meta.lastQuestionAt) || '?'}): ${clip(meta.lastQuestion, 160)}`);
   }
-  if (s.lastError) console.log(`  last error: ${clip(s.lastError, 200)}`);
-  if (s.lastMeta && !running) console.log(`  last meta: ${s.lastMeta}`);
+  if (meta.lastError) console.log(`  last error: ${clip(meta.lastError, 200)}`);
+  if (meta.lastMeta) console.log(`  last meta: ${meta.lastMeta}`);
   console.log(`  lead transcript: ${lead.transcriptPath}`);
-  if (s.sessionId) {
-    const tp = findPeerTranscript(s.backend || backend, s.sessionId);
-    if (tp) console.log(`  peer transcript: ${tp}`);
+  if (meta.sessionId) {
+    const tp = findPeerTranscript(meta.backend || backend, meta.sessionId);
+    if (tp) console.log(`  coagent transcript: ${tp}`);
   }
-  if (fs.existsSync(lastReplyPath(lead.sessionId, peerId))) {
-    console.log(`  last reply: ${lastReplyPath(lead.sessionId, peerId)} (${ageLabel(fs.statSync(lastReplyPath(lead.sessionId, peerId)).mtimeMs)})`);
+  if (fs.existsSync(lastReplyPath(lead.sessionId, genId))) {
+    console.log(`  last reply: ${lastReplyPath(lead.sessionId, genId)} (${ageLabel(fs.statSync(lastReplyPath(lead.sessionId, genId)).mtimeMs)})`);
   }
-  const boxEntries = listOutbox(lead.sessionId, peerId);
-  console.log(`  outbox: ${outboxDir(lead.sessionId, peerId)} (${boxEntries.length} file${boxEntries.length === 1 ? '' : 's'})`);
-  for (const e of boxEntries.slice(0, 5)) console.log(`    - ${e.name} (${ageLabel(e.mtimeMs)})`);
-  if (boxEntries.length > 5) console.log(`    … +${boxEntries.length - 5} more`);
-  console.log(`  state: ${statePath(lead.sessionId, peerId)}`);
+  const box = listOutbox(lead.sessionId, genId);
+  console.log(`  outbox: ${outboxDir(lead.sessionId, genId, false)} (${box.length})`);
+  const gens = S.listGenIds(STATE_DIR, lead.sessionId);
+  if (gens.length > 1) console.log(`  generations: ${gens.length} (coagent sessions)`);
 }
 
-async function cmdReset(cli) {
-  const { lead, peerId } = resolveContext(cli);
-  const all = cli.rest && cli.rest.includes('--all');
-  // parse --all from process - use env or check: reset [--all] [--peer x]
-  const resetAll = process.argv.includes('--all');
-
-  const targets = resetAll ? listPeerIds(lead.sessionId) : [peerId];
-  if (!targets.length) targets.push(DEFAULT_PEER);
-
-  for (const pid of targets) {
-    const s = loadState(lead.sessionId, pid);
-    for (const p of [s.childPid, s.bgPid]) {
-      if (p && isAlive(p)) await killTree(p);
-    }
-    for (const j of listJobs(lead.sessionId, pid)) {
-      if (isJobAlive(j)) {
-        if (j.childPid) await killTree(j.childPid);
-        if (j.workerPid) await killTree(j.workerPid);
-      }
-    }
-    // Keep sticky config, clear session thread
-    const sticky = {
-      peerId: pid,
-      createdAt: s.createdAt || new Date().toISOString(),
-      backend: s.backend || null,
-      backendChoice: s.backendChoice || null,
-      model: s.model || null,
-      personaPath: s.personaPath || null,
-      resetAt: new Date().toISOString(),
-    };
-    saveState(lead.sessionId, pid, sticky);
-    console.log(`co-agent: peer ${pid} thread reset (sticky config kept)`);
+function cmdSessions(cli) {
+  const ctx = resolveContext(cli);
+  const ids = S.listGenIds(STATE_DIR, ctx.lead.sessionId);
+  if (!ids.length) { console.log('no generations yet'); return; }
+  const cur = S.readCurrent(STATE_DIR, ctx.lead.sessionId);
+  for (const id of ids) {
+    const m = S.loadMeta(STATE_DIR, ctx.lead.sessionId, id);
+    const inbox = S.loadInbox(STATE_DIR, ctx.lead.sessionId, id);
+    const done = inbox.filter((i) => i.status === 'done').length;
+    const mark = id === cur ? '*' : ' ';
+    const state = m.archivedAt ? 'archived' : 'current';
+    console.log(
+      `${mark} ${id}  ${state}` +
+      `${m.model ? `  ${m.backend || ''}/${m.model}` : (m.backend ? `  ${m.backend}` : '')}` +
+      `  ${done} consults` +
+      `${m.lastQuestionAt ? `  ${ageLabel(m.lastQuestionAt)}` : ''}` +
+      `${m.lastQuestion ? `  ${clip(m.lastQuestion, 50)}` : ''}`,
+    );
   }
 }
 
-async function cmdRm(cli) {
-  const { lead, peerId } = resolveContext(cli);
-  if (peerId === DEFAULT_PEER && !process.argv.includes('--force')) {
-    fail('refusing to rm peer "main" without --force (use reset to clear thread)');
+function cmdResume(cli, genId) {
+  if (!genId) fail('usage: coagent resume <generation-id>');
+  const ctx = resolveContext(cli);
+  const meta = S.resumeGeneration(STATE_DIR, ctx.lead.sessionId, genId);
+  if (!meta) fail(`unknown generation: ${genId}`);
+  console.log(`co-agent: resumed ${genId}`);
+  console.log(`  thread: ${meta.sessionId || '(none — next message starts one)'}`);
+}
+
+function cmdReset(cli) {
+  const ctx = resolveContext(cli);
+  const old = S.readCurrent(STATE_DIR, ctx.lead.sessionId);
+  const id = S.startGeneration(STATE_DIR, ctx.lead.sessionId);
+  console.log(`co-agent: archived ${old || '(none)'}, started ${id}`);
+  console.log('  old transcript kept. resume it with: coagent resume <id>');
+}
+
+function cmdLog(cli) {
+  const ctx = resolveContext(cli);
+  const inbox = S.loadInbox(STATE_DIR, ctx.lead.sessionId, ctx.genId);
+  if (!inbox.length) { console.log('no consults in this generation'); return; }
+  for (const i of inbox) {
+    console.log(
+      `${i.id}  ${i.status}` +
+      `${i.finishedAt ? `  ${ageLabel(i.finishedAt)}` : (i.createdAt ? `  ${ageLabel(i.createdAt)}` : '')}` +
+      `  ${clip(i.message, 80)}`,
+    );
   }
-  const s = loadState(lead.sessionId, peerId);
-  for (const p of [s.childPid, s.bgPid]) {
-    if (p && isAlive(p)) await killTree(p);
+}
+
+function cmdSearch(cli, query) {
+  if (!query) fail('usage: coagent search "<query>"');
+  const ctx = resolveContext(cli);
+  const hits = S.searchGens(STATE_DIR, ctx.lead.sessionId, query);
+  if (!hits.length) { console.log('no matches'); return; }
+  for (const h of hits.slice(0, 50)) {
+    console.log(`${h.genId}${h.archived ? ' (archived)' : ''}  ${path.basename(h.file)}:${h.line}  ${h.text}`);
   }
-  for (const j of listJobs(lead.sessionId, peerId)) {
-    if (isJobAlive(j)) {
-      if (j.childPid) await killTree(j.childPid);
-      if (j.workerPid) await killTree(j.workerPid);
-    }
-  }
-  const dir = peerDir(lead.sessionId, peerId);
-  fs.rmSync(dir, { recursive: true, force: true });
-  console.log(`co-agent: removed peer ${peerId}`);
-  console.log(`  ${dir}`);
+  if (hits.length > 50) console.log(`… +${hits.length - 50} more`);
 }
 
 function cmdLead(cli) {
-  const { lead, backend, leadChoice, backendChoice, peerId, model } = resolveContext(cli, { allowMint: false });
+  const ctx = resolveContext(cli);
   console.log(JSON.stringify({
-    lead: lead.harness,
-    leadSessionId: lead.sessionId,
-    leadTranscript: lead.transcriptPath,
-    pin: lead.pin || null,
-    peerId,
-    model: model || null,
+    lead: ctx.lead.harness,
+    leadSessionId: ctx.lead.sessionId,
+    leadTranscript: ctx.lead.transcriptPath,
+    pin: ctx.lead.pin || null,
+    genId: ctx.genId,
+    model: ctx.model || null,
+    leadModel: ctx.leadModel,
+    backend: ctx.backend,
     grokSessionEnv: process.env.GROK_SESSION_ID || null,
-    backend,
-    leadChoice,
-    backendChoice,
   }, null, 2));
 }
 
 function cmdDigest(cli) {
-  const { lead, backend, peerId } = resolveContext(cli, { allowMint: false });
-  const state = loadState(lead.sessionId, peerId);
-  const dig = buildDigest(lead, state.lastUuid || null);
-  console.log(`lead=${lead.harness} backend=${backend} peer=${peerId} pin=${lead.pin || '?'}`);
+  const ctx = resolveContext(cli);
+  const dig = buildDigest(ctx.lead, ctx.genId, ctx.meta.lastUuid || null);
+  console.log(`lead=${ctx.lead.harness} backend=${ctx.backend} gen=${ctx.genId} pin=${ctx.lead.pin || '?'}`);
   console.log(`digest: ${dig.digestPath}`);
   console.log(`json: ${dig.jsonPath}`);
   console.log(`lastMarker: ${dig.lastMarker}`);
   console.log(`delta: ${dig.isDelta}${dig.fallbackNote ? ` · fallback: ${dig.fallbackNote}` : ''}`);
-  console.log(`outbox index (all peers): ${(dig.side.outbox || []).length} files`);
-  console.log(`thread: ${state.sessionId || '(none)'}`);
+  console.log(`thread: ${ctx.meta.sessionId || '(none)'}`);
   const text = fs.readFileSync(dig.digestPath, 'utf8');
   const lines = text.split('\n');
   console.log('--- digest preview ---');
@@ -1778,21 +1195,20 @@ function cmdDigest(cli) {
 }
 
 function cmdTranscript(cli) {
-  const { lead, backend, peerId } = resolveContext(cli, { allowMint: false });
-  const state = loadState(lead.sessionId, peerId);
-  const p = findPeerTranscript(state.backend || backend, state.sessionId);
-  if (!p) fail(`no co-agent transcript yet for peer ${peerId}`);
+  const ctx = resolveContext(cli);
+  const p = findPeerTranscript(ctx.meta.backend || ctx.backend, ctx.meta.sessionId);
+  if (!p) fail('no co-agent transcript yet (send a message first)');
   console.log(p);
 }
 
 function cmdOutbox(cli, args) {
-  const { lead, peerId } = resolveContext(cli, { allowMint: false });
+  const ctx = resolveContext(cli);
   const sub = (args[0] || 'list').toLowerCase();
-  const dir = outboxDir(lead.sessionId, peerId);
+  const dir = outboxDir(ctx.lead.sessionId, ctx.genId);
   if (sub === 'path' || sub === 'dir') { console.log(dir); return; }
   if (sub === 'list' || sub === 'ls') {
-    console.log(`outbox (peer ${peerId}): ${dir}`);
-    console.log(formatOutboxListing(listOutbox(lead.sessionId, peerId)));
+    console.log(`outbox (gen ${ctx.genId}): ${dir}`);
+    console.log(formatOutboxListing(listOutbox(ctx.lead.sessionId, ctx.genId)));
     return;
   }
   if (sub === 'cat' || sub === 'show' || sub === 'read') {
@@ -1820,34 +1236,32 @@ function cmdDoctor(cli) {
   console.log(`  binary: ${__filename}`);
   console.log(`  persona: ${PERSONA_FILE} (${fs.existsSync(PERSONA_FILE) ? 'ok' : 'MISSING'})`);
   console.log(`  digest lib: ${path.join(ROOT, 'lib', 'digest.js')} (${fs.existsSync(path.join(ROOT, 'lib', 'digest.js')) ? 'ok' : 'MISSING'})`);
+  console.log(`  session lib: ${path.join(ROOT, 'lib', 'session.js')} (${fs.existsSync(path.join(ROOT, 'lib', 'session.js')) ? 'ok' : 'MISSING'})`);
   console.log(`  claude cli: ${whichBin('claude') || 'NOT FOUND'}`);
   console.log(`  grok cli: ${whichBin('grok') || 'NOT FOUND'}`);
   console.log(`  env GROK_AGENT: ${process.env.GROK_AGENT || '(unset)'}`);
-  console.log(`  env (pre-resolve) GROK_SESSION_ID: ${process.env.GROK_SESSION_ID || '(unset)'}`);
+  console.log(`  env GROK_SESSION_ID: ${process.env.GROK_SESSION_ID || '(unset)'}`);
   try {
-    const { lead, backend, leadChoice, backendChoice, peerId, model } = resolveContext(cli || {}, { allowMint: false });
-    console.log(`  lead: ${lead.harness} ${lead.sessionId}`);
-    console.log(`  pin: ${lead.pin}`);
-    console.log(`  peer: ${peerId}${model ? ` model=${model}` : ''}`);
-    console.log(`  peers: ${listPeerIds(lead.sessionId).join(', ') || '(none)'}`);
-    console.log(`  backend: ${backend} [lead:${leadChoice}, backend:${backendChoice}]`);
-    const s = loadState(lead.sessionId, peerId);
-    console.log(`  peer session: ${s.sessionId || '(none)'}`);
-    console.log(`  running: ${isRunAlive(s)}`);
-    console.log(`  last error: ${s.lastError || '(none)'}`);
-    console.log(`  outbox files: ${listOutbox(lead.sessionId, peerId).length}`);
-    console.log(`  jobs (all peers): ${listAllJobs(lead.sessionId).length}`);
-    console.log(`  persona effort: ${defaultPersona.effort}`);
+    const ctx = resolveContext(cli || {});
+    console.log(`  lead: ${ctx.lead.harness} ${ctx.lead.sessionId}`);
+    console.log(`  pin: ${ctx.lead.pin}`);
+    console.log(`  lead model: ${ctx.leadModel.modelId || '(unknown)'}${ctx.leadModel.effort ? ` · ${ctx.leadModel.effort}` : ''}`);
+    console.log(`  using: ${ctx.backend} ${ctx.model || '(cli default)'} · effort=${ctx.effort}`);
+    console.log(`  generation: ${ctx.genId}`);
+    console.log(`  thread: ${ctx.meta.sessionId || '(none)'}`);
+    console.log(`  queue: ${S.loadInbox(STATE_DIR, ctx.lead.sessionId, ctx.genId).filter((i) => i.status === 'queued' || i.status === 'running').length}`);
+    console.log(`  generations: ${S.listGenIds(STATE_DIR, ctx.lead.sessionId).length}`);
+    console.log(`  persona effort (file): ${defaultPersona.effort}`);
   } catch (e) {
     console.log(`  lead resolve: FAIL — ${e.message || e}`);
   }
 }
 
 async function cmdWatch(cli, intervalSec) {
-  const { lead, backend, peerId } = resolveContext(cli);
-  let state = loadState(lead.sessionId, peerId);
-  let b = state.backend || backend;
-  let p = findPeerTranscript(b, state.sessionId);
+  const ctx = resolveContext(cli);
+  const { lead, backend, genId, meta } = ctx;
+  let b = meta.backend || backend;
+  let p = findPeerTranscript(b, meta.sessionId);
   const interval = Math.max(0.2, intervalSec || 1) * 1000;
   const follow = !!cli.follow;
   const deadline = cli.timeoutSec != null && cli.timeoutSec > 0
@@ -1855,32 +1269,33 @@ async function cmdWatch(cli, intervalSec) {
     : null;
 
   if (!p && !follow) {
-    console.log(`co-agent: no thread/transcript yet for peer ${peerId}`);
+    console.log('co-agent: no thread/transcript yet');
     return;
   }
 
   let offset = 0;
   if (p && fs.existsSync(p)) offset = fs.statSync(p).size;
-
-  console.log(`watching peer ${peerId} · ${p || '(waiting for transcript)'} · follow=${follow}`);
+  console.log(`watching gen ${genId} · ${p || '(waiting)'} · follow=${follow}`);
 
   while (true) {
     if (deadline && Date.now() > deadline) return;
-    state = loadState(lead.sessionId, peerId);
-    b = state.backend || backend;
-    p = findPeerTranscript(b, state.sessionId);
+    const m = S.loadMeta(STATE_DIR, lead.sessionId, genId);
+    b = m.backend || backend;
+    p = findPeerTranscript(b, m.sessionId);
     if (p && fs.existsSync(p)) {
       const { lines, size } = peerEventsSince(b, p, offset);
       for (const ln of lines) console.log(ln);
       offset = size;
     }
-    if (!follow && !isRunAlive(state) && !listJobs(lead.sessionId, peerId).some(isJobAlive)) {
+    const busy = S.workerAlive(STATE_DIR, lead.sessionId, genId)
+      || S.loadInbox(STATE_DIR, lead.sessionId, genId).some((i) => i.status === 'running' || i.status === 'queued');
+    if (!follow && !busy) {
       if (p && fs.existsSync(p)) {
         const { lines, size } = peerEventsSince(b, p, offset);
         for (const ln of lines) console.log(ln);
         offset = size;
       }
-      console.log(`\n_(run finished · reply: ${lastReplyPath(lead.sessionId, peerId)})_`);
+      console.log(`\n_(idle · reply: ${lastReplyPath(lead.sessionId, genId)})_`);
       return;
     }
     await sleep(interval);
@@ -1936,48 +1351,43 @@ function peerEventsSince(backend, transcriptPath, sinceByte) {
   }
 }
 
-// ─── main ───────────────────────────────────────────────────────────────────
-
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (parsed.help) { printHelp(); return; }
   const cli = {
     lead: parsed.lead,
-    peer: parsed.peer,
     modelSpec: parsed.modelSpec,
     persona: parsed.persona,
-    save: parsed.save,
     follow: parsed.follow,
     raw: parsed.raw,
-    parallel: parsed.parallel,
+    interrupt: parsed.interrupt,
+    clearQueue: parsed.clearQueue,
     timeoutSec: parsed.timeoutSec,
   };
   const rest = parsed.rest;
   const verb = rest[0];
 
   const verbs = new Set([
-    'status', 'reset', 'rm', 'peers', 'lead', 'digest', 'transcript',
-    'outbox', 'watch', 'bg', 'join', 'jobs', 'doctor',
+    'status', 'reset', 'sessions', 'resume', 'log', 'search',
+    'lead', 'digest', 'transcript', 'doctor', 'outbox', 'watch',
+    'ask', 'peers', 'rm', 'bg', 'join', 'jobs',
   ]);
-  if (process.env.COAGENT_BG_WORKER === '1' && rest.length && !verbs.has(verb)) {
-    const jobId = process.env.COAGENT_JOB_ID || null;
-    const isolated = process.env.COAGENT_ISOLATED === '1';
-    if (process.env.COAGENT_PEER && cli.peer == null) cli.peer = process.env.COAGENT_PEER;
-    await talk(rest.join(' '), cli, { background: true, jobId, isolated });
-    return;
+
+  if (!verb) fail('usage: coagent [options] "<message>" | status | reset | …  (try --help)');
+
+  if (verb === 'ask' || verb === 'peers' || verb === 'rm' || verb === 'bg' || verb === 'join' || verb === 'jobs') {
+    fail('one standing co-agent now. Send: coagent "…". Fresh tape: coagent reset. Interrupt: coagent --interrupt "…"');
   }
-
-  if (!verb) fail('usage: coagent [options] "<message>" | bg | join | peers | …  (try --help)');
-
   if (verb === 'status') return cmdStatus(cli);
-  if (verb === 'peers') return cmdPeers(cli);
-  if (verb === 'reset') return await cmdReset(cli);
-  if (verb === 'rm') return await cmdRm(cli);
+  if (verb === 'sessions') return cmdSessions(cli);
+  if (verb === 'resume') return cmdResume(cli, rest[1]);
+  if (verb === 'reset') return cmdReset(cli);
+  if (verb === 'log') return cmdLog(cli);
+  if (verb === 'search') return cmdSearch(cli, rest.slice(1).join(' '));
   if (verb === 'lead') return cmdLead(cli);
   if (verb === 'digest') return cmdDigest(cli);
   if (verb === 'transcript') return cmdTranscript(cli);
   if (verb === 'doctor') return cmdDoctor(cli);
-  if (verb === 'jobs') return cmdJobs(cli);
   if (verb === 'outbox') return cmdOutbox(cli, rest.slice(1));
   if (verb === 'watch') {
     let interval;
@@ -1986,25 +1396,8 @@ async function main() {
     }
     return cmdWatch(cli, interval);
   }
-  if (verb === 'bg') {
-    const msgParts = rest.slice(1);
-    const filtered = msgParts.filter((a) => a !== '--parallel');
-    const msg = filtered.join(' ');
-    if (!msg) fail('usage: coagent bg [--parallel] [--peer …] "<message>"');
-    return cmdBg(msg, cli);
-  }
-  if (verb === 'join') {
-    let jobId = null;
-    let timeout = 600;
-    for (const a of rest.slice(1)) {
-      if (a === '--raw') { cli.raw = true; continue; }
-      if (/^[0-9a-f]{6,12}$/i.test(a) && jobId == null) { jobId = a; continue; }
-      if (!Number.isNaN(Number(a))) { timeout = Number(a); continue; }
-    }
-    return cmdJoin(cli, jobId, timeout);
-  }
 
-  await talk(rest.join(' '), cli, { background: false });
+  await cmdSend(rest.join(' '), cli);
 }
 
 if (require.main === module) {
@@ -2014,7 +1407,8 @@ if (require.main === module) {
 module.exports = {
   buildDigest,
   resolveLead,
+  parseModelSpec,
+  detectLeadModel,
   digestLib,
-  resolvePeerId,
-  listPeerIds,
+  session: S,
 };

@@ -1,15 +1,16 @@
 # Co-agent
 
-Harness-agnostic **peer agents** for Claude Code and Grok Build.
+The lead agent's standing colleague. Same idea as Grok is an agent for the human: the co-agent is an agent for the lead.
 
 ```
-You (human) → Lead agent → Coagent peer(s)
+You (human) → Lead (this Grok / Claude) → one co-agent
 ```
 
-- **Checkout:** `~/projects/coagent` (this repo)
-- **Home:** `~/.coagent/` (runtime; `state/` is not in git)
+One colleague **per harness session**. A different Grok window has a different co-agent. Messages **resume** that colleague's transcript. `reset` archives the tape and starts a new one; nothing is deleted.
+
+- **Checkout:** `~/projects/coagent`
+- **Home:** `~/.coagent/` (`state/` is not in git)
 - **Binary:** `~/.local/bin/coagent`
-- **Shim:** `~/.claude/bin/coagent`
 
 ## Install
 
@@ -20,96 +21,45 @@ cd ~/projects/coagent
 coagent doctor
 ```
 
-Re-run `./install.sh` after pulling. Session state in `~/.coagent/state` is left alone. `persona.md` is seeded only if you do not already have one.
-
-## Peers
-
-Each lead conversation can have **multiple independent peers**. Peers share the lead **digest** (conversation context) but have separate:
-
-- chat session / memory
-- `state.json`
-- outbox
-- jobs
-
-| Flag | Behavior |
-|------|----------|
-| *(none)* | peer **`main`** (default standing peer) |
-| `--peer <id>` | resume that peer, or **create** with that id |
-| `--peer new` | mint a **UUID**, create, print id |
-
-```bash
-coagent "…"                                    # peer main
-coagent --peer new "…"                         # new uuid peer
-coagent --peer 019f… "…"                       # resume / create that id
-coagent --model claude/opus "…"                # harness + model (cannot mismatch)
-coagent --peer new --model claude --persona review --save "…"
-```
-
-**`--model`** is `backend` or `backend/modelId` (e.g. `claude`, `claude/opus`, `grok`). Not a bare model name — avoids `grok`+`opus` mismatches.
-Sticky model + persona path set on **first message** for a peer. Per-call flags override **this turn only**, unless **`--save`**.
-
 ## Usage
 
 ```bash
-coagent "…"
-coagent bg [--parallel] [--peer …] "…"
-coagent join [jobId] [--raw] [timeout_s]
-coagent jobs
-coagent peers
-coagent status | doctor | lead | digest | transcript
-coagent reset [--peer id] [--all]     # clear session thread; keep sticky config
-coagent rm --peer <id> [--force]      # delete peer dir (main needs --force)
-coagent watch [-f] [--timeout N]
-coagent outbox [list|path|cat <file>] # this peer's outbox
-
-coagent --model claude|grok|claude/<id>|grok/<id> …
-coagent --persona <name|path> …
+coagent "review this diff"             # enqueue, wait, resume the standing thread
+coagent --interrupt "stop, do this"    # kill the current turn, this message next
+coagent status                         # gen, queue, last reply
+coagent watch                          # live tail
+coagent reset                          # archive this gen, start a fresh transcript
+coagent sessions                       # list generations
+coagent resume <id>                    # make an old gen current
+coagent log                            # consults in the current gen
+coagent search "widget"                # search this session's generations
+coagent doctor
 ```
 
-### Parallelism
+Default model is **whatever the lead is running** (Grok session `current_model_id`, or the last Claude `message.model`). Override this turn with `--model grok-4.6` / `--model claude`.
 
-- **Different peers** can run at the same time.
-- Same peer: default `bg` is one-at-a-time; `bg --parallel` uses an **isolated** session for that job.
-- Foreground on peer A does **not** stop peer B.
+A second `coagent "…"` while one is in flight **queues**. `--interrupt` preempts the current turn and keeps the rest of the queue unless you also pass `--clear-queue`.
 
-### join --raw
-
-```bash
-coagent join 5a4e0008 --raw
-```
+`--peer`, `ask`, `bg`, `join`, and `peers` are gone. There is one colleague.
 
 ## Layout
 
 ```
 ~/.coagent/state/<leadSessionId>/
-  context.md / context.json     # shared lead digest
-  peers/
-    main/
-      state.json
-      last_reply.md
-      outbox/
-      jobs/
-    <uuid>/
-      …
+  context.md / context.json     # digest of user ⇄ lead
+  current                       # generation id
+  gens/<genId>/
+    meta.json                   # peer session id, model, last marker
+    inbox.json                  # queued / running / done consults
+    last_reply.md
+    outbox/
 ```
 
-Legacy flat `state.json` / `outbox` / `jobs` under the lead dir are **migrated into `peers/main/`** on first use.
+`reset` writes a new `gens/<id>` and points `current` at it. `resume` points back.
 
-## Persona & model
+## Persona
 
-- Default persona: `~/.coagent/persona.md` (instructions + effort/permissions; **prefer not** to put model here).
-- Named personas: `~/.coagent/personas/<name>.md` via `--persona <name>`.
-- Model: `--model backend[/id]` / `COAGENT_MODEL` / peer sticky. No separate `--backend`.
-
-## Pinning (Grok)
-
-Order: `GROK_SESSION_ID` / `COAGENT_LEAD_SESSION_ID` → ancestor PID → cwd → mtime.
-
-## Doctor
-
-```bash
-coagent doctor
-```
+Default: `~/.coagent/persona.md`. Named: `~/.coagent/personas/<name>.md` via `--persona <name>`.
 
 ## Develop
 
