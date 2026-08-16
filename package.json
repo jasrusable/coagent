@@ -6,7 +6,7 @@
     "coagent": "./bin/coagent"
   },
   "scripts": {
-    "test": "node test/digest.test.js && node test/session.test.js && node test/cli.test.js"
+    "test": "node test/digest.test.js && node test/session.test.js && node test/cli.test.js && node test/concurrency.test.js"
   },
   "license": "MIT",
   "private": true
