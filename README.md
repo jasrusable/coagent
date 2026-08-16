@@ -31,12 +31,13 @@ coagent watch                          # live tail
 coagent reset                          # archive this gen, start a fresh transcript
 coagent sessions                       # list generations
 coagent resume <id>                    # make an old gen current
-coagent log                            # consults in the current gen
+coagent log                            # consults in the current gen (newest first)
 coagent search "widget"                # search this session's generations
+coagent gc                             # drop empty archived gens; trim old inbox rows
 coagent doctor
 ```
 
-Default model is **whatever the lead is running** (Grok session `current_model_id`, or the last Claude `message.model`). Override this turn with `--model grok-4.6` / `--model claude`.
+Default model, effort, Grok `--agent`, and `--cwd` follow the lead session. Override model this turn with `--model grok-4.6` / `--model claude`. Progress streams on stderr; for a long review, background the command in the harness.
 
 A second `coagent "…"` while one is in flight **queues**. `--interrupt` preempts the current turn and keeps the rest of the queue unless you also pass `--clear-queue`.
 

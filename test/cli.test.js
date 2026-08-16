@@ -3,7 +3,7 @@
 
 const assert = require('assert');
 const path = require('path');
-const { parseModelSpec } = require('../bin/coagent');
+const { parseModelSpec, parseArgs } = require('../bin/coagent');
 
 function test(name, fn) {
   try {
@@ -36,6 +36,17 @@ test('parseModelSpec accepts raw grok-4.6', () => {
 test('parseModelSpec empty is null', () => {
   assert.equal(parseModelSpec(null).raw, null);
   assert.equal(parseModelSpec('').raw, null);
+});
+
+test('parseArgs rejects --timeout 0 and NaN', () => {
+  assert.throws(() => parseArgs(['--timeout', '0', 'hi']), /timeout/);
+  assert.throws(() => parseArgs(['--timeout', 'nope', 'hi']), /timeout/);
+});
+
+test('parseArgs accepts a positive timeout', () => {
+  const a = parseArgs(['--timeout', '30', 'hello']);
+  assert.equal(a.timeoutSec, 30);
+  assert.deepEqual(a.rest, ['hello']);
 });
 
 if (!process.exitCode) console.log('\nall cli tests passed');

@@ -93,10 +93,14 @@ test('detectGrokLeadModel reads summary.json', () => {
   fs.writeFileSync(path.join(dir, 'summary.json'), JSON.stringify({
     current_model_id: 'grok-4.6',
     reasoning_effort: 'xhigh',
+    agent_name: 'grok-build-plan',
+    info: { cwd: '/Users/jason/projects/FinWise' },
   }));
   const d = S.detectGrokLeadModel(dir);
   assert.equal(d.modelId, 'grok-4.6');
   assert.equal(d.effort, 'xhigh');
+  assert.equal(d.agent, 'grok-build-plan');
+  assert.equal(d.cwd, '/Users/jason/projects/FinWise');
 });
 
 test('detectClaudeLeadModel reads last assistant model', () => {
@@ -114,6 +118,56 @@ test('searchGens finds archived replies', () => {
   fs.writeFileSync(path.join(S.genDir(root, lead, gen), 'last_reply.md'), 'the widget bug is fixed\n');
   const hits = S.searchGens(root, lead, 'widget');
   assert.ok(hits.some((h) => h.genId === gen && /widget/.test(h.text)));
+});
+
+test('reapStale fails running items when the worker is dead', () => {
+  const root = tmpState();
+  const lead = 'lead-7';
+  const gen = S.ensureCurrent(root, lead);
+  const item = S.enqueue(root, lead, gen, 'orphaned');
+  S.updateItem(root, lead, gen, item.id, { status: 'running' });
+  const lock = path.join(S.genDir(root, lead, gen), 'worker.lock');
+  fs.writeFileSync(lock, '1\n');
+  const reaped = S.reapStale(root, lead, gen);
+  assert.deepEqual(reaped.ids, [item.id]);
+  assert.equal(S.findItem(root, lead, gen, item.id).status, 'failed');
+  assert.match(S.findItem(root, lead, gen, item.id).error, /stale/);
+});
+
+test('currentGeneration does not mint an empty gen', () => {
+  const root = tmpState();
+  assert.equal(S.currentGeneration(root, 'lead-fresh'), null);
+  assert.deepEqual(S.listGenIds(root, 'lead-fresh'), []);
+});
+
+test('trimInbox keeps live rows and the newest settled ones', () => {
+  const root = tmpState();
+  const lead = 'lead-trim';
+  const gen = S.ensureCurrent(root, lead);
+  for (let i = 0; i < 4; i++) {
+    const it = S.enqueue(root, lead, gen, `m${i}`);
+    S.updateItem(root, lead, gen, it.id, {
+      status: 'done',
+      createdAt: `2026-01-0${i + 1}T00:00:00.000Z`,
+      finishedAt: `2026-01-0${i + 1}T00:00:01.000Z`,
+    });
+  }
+  const live = S.enqueue(root, lead, gen, 'live');
+  const dropped = S.trimInbox(root, lead, gen, 2);
+  assert.equal(dropped, 2);
+  const inbox = S.loadInbox(root, lead, gen);
+  assert.ok(inbox.some((i) => i.id === live.id));
+  assert.equal(inbox.filter((i) => i.status === 'done').length, 2);
+});
+
+test('gcEmptyGens removes unused archived gens only', () => {
+  const root = tmpState();
+  const lead = 'lead-gc';
+  const a = S.ensureCurrent(root, lead);
+  const b = S.startGeneration(root, lead);
+  assert.equal(S.gcEmptyGens(root, lead), 1);
+  assert.equal(S.readCurrent(root, lead), b);
+  assert.ok(!S.listGenIds(root, lead).includes(a));
 });
 
 test('stale worker lock can be stolen', () => {

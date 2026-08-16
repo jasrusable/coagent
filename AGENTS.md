@@ -23,8 +23,9 @@ This checkout is the source. Runtime home is `~/.coagent/` (`state/` is not in g
 
 - Do not commit `~/.coagent/state` or transcripts.
 - One co-agent per lead session id. Do not add `--peer` / UUID farms / `ask`.
-- Default model is the lead's current model. `--model` is a this-turn override.
-- `coagent "…"` enqueues and waits. `--interrupt` preempts. `reset` archives.
+- Default model/effort/agent/cwd follow the lead. `--model` is a this-turn override.
+- Send blocks; progress is on stderr. Project `AGENTS.md` files must not mention coagent.
+- `coagent "…"` enqueues and waits. `--interrupt` preempts. `reset` archives. `gc` trims.
 - After changing `bin/` or `lib/`, run `./install.sh` and `npm test`.
 
 ## Commands

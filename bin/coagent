@@ -52,7 +52,12 @@ const INHERITANCE_PREAMBLE = [
   'under the outbox directory you are given. Chat reply = short summary + full path(s).',
 ].join(' ');
 
-const fail = (msg) => { console.error(`coagent: ${msg}`); process.exit(1); };
+function fail(msg) {
+  const text = `coagent: ${msg}`;
+  if (require.main !== module) throw new Error(text);
+  console.error(text);
+  process.exit(1);
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isAlive = S.isAlive;
 
@@ -150,8 +155,9 @@ Usage:
   coagent reset                           archive this gen, start a fresh transcript
   coagent sessions                        list generations
   coagent resume <id>                     make an old gen current
-  coagent log                             consults in the current gen
+  coagent log                             consults in the current gen (newest first)
   coagent search "<query>"                search this session's generations
+  coagent gc                              drop empty archived gens; trim old inbox rows
   coagent digest | lead | transcript | doctor | outbox
 
 Options:
@@ -164,6 +170,10 @@ Options:
   --timeout N              wait N seconds (default 600)
   --follow, -f             watch: keep following
   --help, -h
+
+  A send blocks until this reply. Progress (and watch) stream on stderr.
+  For a long review, background the command in your harness and keep working.
+  A failed turn does not stop later queued messages.
 
   (--peer / ask / --backend are rejected)
 
@@ -210,6 +220,9 @@ function parseArgs(argv) {
     }
     if (a.startsWith('-') && a !== '-') fail(`unknown option ${a} (try --help)`);
     rest.push(a);
+  }
+  if (timeoutSec != null && !(timeoutSec > 0)) {
+    fail('--timeout must be a positive number of seconds');
   }
   return { lead, modelSpec, persona, follow, raw, interrupt, clearQueue, timeoutSec, rest };
 }
@@ -608,27 +621,50 @@ function buildDigest(lead, genId, sinceMarker) {
     lastMarker: result.lastMarker,
     isDelta: result.isDelta,
     side: result.side,
+    inline: result.inline || '',
     fallbackNote: result.fallbackNote,
     hardFallback: result.hardFallback,
   };
 }
 
-function runCmd(cmd, args, onSpawn) {
+function childEnv() {
+  const env = { ...process.env };
+  delete env.GROK_AGENT;
+  delete env.COAGENT_BG_WORKER;
+  delete env.GROK_SESSION_ID;
+  delete env.CLAUDE_CODE_SESSION_ID;
+  return env;
+}
+
+function runCmd(cmd, args, { onSpawn, cwd, backend, sessionId } = {}) {
   return new Promise((resolve) => {
-    const childEnv = { ...process.env };
-    delete childEnv.GROK_AGENT;
-    delete childEnv.COAGENT_BG_WORKER;
     const child = spawn(cmd, args, {
-      cwd: process.cwd(),
-      env: childEnv,
+      cwd: cwd || process.cwd(),
+      env: childEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     if (onSpawn) onSpawn(child.pid);
     let out = '';
     let err = '';
+    let offset = 0;
+    const existingTape = sessionId && findPeerTranscript(backend, sessionId, cwd);
+    if (existingTape && fs.existsSync(existingTape)) offset = fs.statSync(existingTape).size;
+    const pump = () => {
+      if (!sessionId) return;
+      const tpath = findPeerTranscript(backend, sessionId, cwd);
+      if (!tpath) return;
+      const { lines, size } = peerEventsSince(backend, tpath, offset);
+      for (const ln of lines) console.error(ln);
+      offset = size;
+    };
+    const timer = setInterval(pump, 400);
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d; });
-    child.on('close', (code) => resolve({ code, out, err }));
+    child.on('close', (code) => {
+      clearInterval(timer);
+      pump();
+      resolve({ code, out, err });
+    });
   });
 }
 
@@ -685,7 +721,7 @@ function buildClaudeArgs({ prompt, effort, model, permissionMode, allowedTools, 
   return [...base, '--session-id', sessionId, '--append-system-prompt', systemBundle(persona)];
 }
 
-function buildGrokArgs({ prompt, effort, model, permissionMode, allowedTools, disallowedTools, persona, sessionId, resume }) {
+function buildGrokArgs({ prompt, effort, model, permissionMode, allowedTools, disallowedTools, persona, sessionId, resume, agent, cwd }) {
   const base = [
     '-p', prompt,
     '--output-format', 'json',
@@ -697,11 +733,13 @@ function buildGrokArgs({ prompt, effort, model, permissionMode, allowedTools, di
   if (allowedTools) base.push('--tools', allowedTools.split(/[\s,]+/).filter(Boolean).join(','));
   if (disallowedTools) base.push('--disallowed-tools', disallowedTools.split(/[\s,]+/).filter(Boolean).join(','));
   if (model) base.push('--model', model);
+  if (agent) base.push('--agent', agent);
+  if (cwd) base.push('--cwd', cwd);
   if (resume) return [...base, '--resume', sessionId];
   return [...base, '--session-id', sessionId];
 }
 
-function findPeerTranscript(backend, peerSessionId) {
+function findPeerTranscript(backend, peerSessionId, cwd) {
   if (!peerSessionId) return null;
   if (backend === 'claude') {
     if (!fs.existsSync(CLAUDE_PROJECTS)) return null;
@@ -709,7 +747,7 @@ function findPeerTranscript(backend, peerSessionId) {
       .map((d) => path.join(CLAUDE_PROJECTS, d, `${peerSessionId}.jsonl`))
       .find((p) => fs.existsSync(p)) || null;
   }
-  const dir = grokSessionDir(peerSessionId, process.cwd()) || grokSessionDir(peerSessionId);
+  const dir = grokSessionDir(peerSessionId, cwd || process.cwd()) || grokSessionDir(peerSessionId);
   return dir ? path.join(dir, 'updates.jsonl') : null;
 }
 
@@ -751,12 +789,15 @@ function writeReplyFiles(leadSid, genId, { answer, meta, message, backend, peerS
   return { body: answer, wrapped: header };
 }
 
-function resolveContext(cli) {
+function resolveContext(cli, { create = true } = {}) {
   const defaultPersona = loadPersona(PERSONA_FILE);
   const leadChoice = normalizeChoice(cli.lead ?? process.env.COAGENT_LEAD ?? defaultPersona.lead, 'lead');
   const lead = resolveLead(leadChoice);
-  const genId = S.ensureCurrent(STATE_DIR, lead.sessionId);
-  const meta = S.loadMeta(STATE_DIR, lead.sessionId, genId);
+  let genId = S.currentGeneration(STATE_DIR, lead.sessionId);
+  if (!genId && create) genId = S.ensureCurrent(STATE_DIR, lead.sessionId);
+  const meta = genId
+    ? S.loadMeta(STATE_DIR, lead.sessionId, genId)
+    : { sessionId: null, archivedAt: null, personaPath: null };
 
   const personaPath = resolvePersonaPath(
     cli.persona || process.env.COAGENT_PERSONA || meta.personaPath || null,
@@ -789,6 +830,9 @@ function resolveContext(cli) {
     console.error('coagent: warning: pinned by newest transcript in this tree — may be another window');
   }
 
+  const leadCwd = (backend === lead.harness && leadModel.cwd) || process.cwd();
+  const agent = (backend === 'grok' && backend === lead.harness && leadModel.agent) || null;
+
   return {
     persona,
     personaPath,
@@ -799,7 +843,16 @@ function resolveContext(cli) {
     genId,
     meta,
     leadModel,
+    leadCwd,
+    agent,
+    noGen: !genId,
   };
+}
+
+async function reap(leadSid, genId) {
+  if (!genId) return;
+  const { orphanPid } = S.reapStale(STATE_DIR, leadSid, genId);
+  if (orphanPid && isAlive(orphanPid)) await killTree(orphanPid);
 }
 
 function buildPrompt({ dig, lead, backend, message, leadSid, genId }) {
@@ -812,17 +865,21 @@ function buildPrompt({ dig, lead, backend, message, leadSid, genId }) {
       ].join('\n')
     : 'Outbox is currently empty.';
 
+  const inline = (dig.inline || '').trim();
   return [
     `You are the lead agent's standing colleague (full capability, shared workspace).`,
     `Generation: ${genId}.`,
     ``,
-    `Shared lead context (user ⇄ lead — read first):`,
+    `Live user ⇄ lead context (already inlined — do not skip):`,
+    inline || '_(no speech in the lead transcript yet)_',
+    ``,
+    `Full digest (only if you need more than the inline slice):`,
     `  ${dig.digestPath}`,
     dig.jsonPath ? `Structured snapshot JSON: ${dig.jsonPath}` : '',
+    `Raw lead transcript: ${lead.transcriptPath}`,
     `Outbox: ${box}`,
     existingNote,
     `Write durable artifacts to the outbox. Reply: short summary + full path(s).`,
-    `Raw lead transcript: ${lead.transcriptPath}`,
     ``,
     `Lead harness: ${lead.harness} (pin=${lead.pin || '?'}). Backend: ${backend}.`,
     ``,
@@ -832,7 +889,7 @@ function buildPrompt({ dig, lead, backend, message, leadSid, genId }) {
 }
 
 async function runTurn(ctx, item) {
-  const { persona, lead, backend, model, effort, genId } = ctx;
+  const { persona, lead, backend, model, effort, genId, leadCwd, agent } = ctx;
   const mainSid = lead.sessionId;
   let meta = S.loadMeta(STATE_DIR, mainSid, genId);
 
@@ -856,6 +913,8 @@ async function runTurn(ctx, item) {
     disallowedTools: persona.disallowedTools,
     mcp: persona.mcp,
     persona: persona.persona,
+    agent: agent || null,
+    cwd: leadCwd || process.cwd(),
   };
 
   const mkNew = () => {
@@ -885,14 +944,20 @@ async function runTurn(ctx, item) {
   };
 
   const cmd = backend === 'claude' ? 'claude' : 'grok';
-  let res = await runCmd(cmd, run.args, stamp(run.sid));
+  const runOpts = (sid) => ({
+    onSpawn: stamp(sid),
+    cwd: leadCwd || process.cwd(),
+    backend,
+    sessionId: sid,
+  });
+  let res = await runCmd(cmd, run.args, runOpts(run.sid));
 
   const latest = S.findItem(STATE_DIR, mainSid, genId, item.id);
   if (latest && latest.status === 'interrupted') return { interrupted: true };
 
   if (res.code !== 0 && existing) {
     const fresh = mkNew();
-    const retry = await runCmd(cmd, fresh.args, stamp(fresh.sid));
+    const retry = await runCmd(cmd, fresh.args, runOpts(fresh.sid));
     const again = S.findItem(STATE_DIR, mainSid, genId, item.id);
     if (again && again.status === 'interrupted') return { interrupted: true };
     if (retry.code === 0) { run = fresh; res = retry; }
@@ -910,7 +975,7 @@ async function runTurn(ctx, item) {
     ? (parsed.isError ? `⚠ ${parsed.subtype}` : parsed.subtype)
     : (parsed.isError ? '⚠ error' : null);
   const dur = parsed.durMs != null ? `${(parsed.durMs / 1000).toFixed(1)}s` : null;
-  const tpath = findPeerTranscript(backend, run.sid);
+  const tpath = findPeerTranscript(backend, run.sid, leadCwd);
   const bits = [
     `lead=${lead.harness}`,
     `model=${model || backend}`,
@@ -951,6 +1016,7 @@ async function runTurn(ctx, item) {
 async function processQueue(ctx) {
   const { lead, genId } = ctx;
   const mainSid = lead.sessionId;
+  await reap(mainSid, genId);
   for (;;) {
     const next = S.nextQueued(STATE_DIR, mainSid, genId);
     if (!next) return;
@@ -977,12 +1043,18 @@ async function processQueue(ctx) {
         ...S.loadMeta(STATE_DIR, mainSid, genId),
         lastError: result.error,
       });
+      const leftover = S.loadInbox(STATE_DIR, mainSid, genId).filter((i) => i.status === 'queued').length;
+      if (leftover) {
+        console.error(`coagent: item ${next.id} failed; continuing queue (${leftover} remaining)`);
+      }
       continue;
     }
     S.updateItem(STATE_DIR, mainSid, genId, next.id, {
       status: 'done',
       finishedAt: new Date().toISOString(),
       error: null,
+      answer: result.answer || null,
+      meta: result.meta || null,
     });
   }
 }
@@ -1007,12 +1079,13 @@ async function waitForItem(leadSid, genId, itemId, timeoutSec, ctx) {
   const timeoutMs = (timeoutSec != null ? timeoutSec : 600) * 1000;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    await reap(leadSid, genId);
     const item = S.findItem(STATE_DIR, leadSid, genId, itemId);
     if (!item) fail(`item ${itemId} disappeared`);
     if (item.status === 'done') return item;
     if (item.status === 'failed') fail(`co-agent failed: ${item.error || 'unknown'}`);
     if (item.status === 'interrupted') fail(`item ${itemId} was interrupted`);
-    if (item.status === 'queued' && !S.workerAlive(STATE_DIR, leadSid, genId) && ctx) {
+    if ((item.status === 'queued' || item.status === 'running') && !S.workerAlive(STATE_DIR, leadSid, genId) && ctx) {
       await becomeWorkerAndDrain(ctx);
       continue;
     }
@@ -1027,9 +1100,11 @@ async function killCurrentChild(leadSid, genId) {
 }
 
 async function cmdSend(message, cli) {
+  if (!String(message || '').trim()) fail('usage: coagent "<message>"');
   const ctx = resolveContext(cli);
   const { lead, genId } = ctx;
   const mainSid = lead.sessionId;
+  await reap(mainSid, genId);
 
   if (cli.interrupt) {
     S.interruptRunning(STATE_DIR, mainSid, genId, { clearQueue: cli.clearQueue });
@@ -1041,28 +1116,31 @@ async function cmdSend(message, cli) {
     await becomeWorkerAndDrain(ctx);
   }
   const done = await waitForItem(mainSid, genId, item.id, cli.timeoutSec, ctx);
-  const replyMeta = S.readJson(lastReplyMetaPath(mainSid, genId), {});
+  const answer = done.answer || '';
   if (cli.raw) {
-    process.stdout.write((replyMeta.answer || '') + (String(replyMeta.answer || '').endsWith('\n') ? '' : '\n'));
+    process.stdout.write(answer + (answer.endsWith('\n') ? '' : '\n'));
     return;
   }
-  if (fs.existsSync(lastReplyPath(mainSid, genId))) {
+  const latestMeta = S.readJson(lastReplyMetaPath(mainSid, genId), {});
+  if (latestMeta.itemId === done.id && fs.existsSync(lastReplyPath(mainSid, genId))) {
     const body = fs.readFileSync(lastReplyPath(mainSid, genId), 'utf8');
-    if (replyMeta.itemId === done.id || !replyMeta.itemId) {
-      process.stdout.write(body.endsWith('\n') ? body : `${body}\n`);
-    } else {
-      console.log(replyMeta.answer || '(done)');
-    }
+    process.stdout.write(body.endsWith('\n') ? body : `${body}\n`);
   } else {
-    console.log(replyMeta.answer || '(done)');
+    console.log(answer || '(done)');
   }
-  if (replyMeta.meta) console.log(`\n↳ ${replyMeta.meta}`);
+  if (done.meta) console.log(`\n↳ ${done.meta}`);
   console.log(`↳ reply: ${lastReplyPath(mainSid, genId)}`);
 }
 
-function cmdStatus(cli) {
-  const ctx = resolveContext(cli);
+async function cmdStatus(cli) {
+  const ctx = resolveContext(cli, { create: false });
   const { lead, backend, model, effort, genId, meta, leadModel } = ctx;
+  if (ctx.noGen) {
+    console.log(`co-agent: lead=${lead.harness} (${lead.sessionId}) · pin=${lead.pin || '?'}`);
+    console.log('  generation: (none — send a message to start one)');
+    return;
+  }
+  await reap(lead.sessionId, genId);
   const inbox = S.loadInbox(STATE_DIR, lead.sessionId, genId);
   const live = inbox.filter((i) => i.status === 'queued' || i.status === 'running');
   const w = S.readWorker(STATE_DIR, lead.sessionId, genId);
@@ -1089,7 +1167,7 @@ function cmdStatus(cli) {
   if (meta.lastMeta) console.log(`  last meta: ${meta.lastMeta}`);
   console.log(`  lead transcript: ${lead.transcriptPath}`);
   if (meta.sessionId) {
-    const tp = findPeerTranscript(meta.backend || backend, meta.sessionId);
+    const tp = findPeerTranscript(meta.backend || backend, meta.sessionId, ctx.leadCwd);
     if (tp) console.log(`  coagent transcript: ${tp}`);
   }
   if (fs.existsSync(lastReplyPath(lead.sessionId, genId))) {
@@ -1102,7 +1180,11 @@ function cmdStatus(cli) {
 }
 
 function cmdSessions(cli) {
-  const ctx = resolveContext(cli);
+  const ctx = resolveContext(cli, { create: false });
+  if (ctx.noGen && !S.listGenIds(STATE_DIR, ctx.lead.sessionId).length) {
+    console.log('no generations yet');
+    return;
+  }
   const ids = S.listGenIds(STATE_DIR, ctx.lead.sessionId);
   if (!ids.length) { console.log('no generations yet'); return; }
   const cur = S.readCurrent(STATE_DIR, ctx.lead.sessionId);
@@ -1124,7 +1206,7 @@ function cmdSessions(cli) {
 
 function cmdResume(cli, genId) {
   if (!genId) fail('usage: coagent resume <generation-id>');
-  const ctx = resolveContext(cli);
+  const ctx = resolveContext(cli, { create: false });
   const meta = S.resumeGeneration(STATE_DIR, ctx.lead.sessionId, genId);
   if (!meta) fail(`unknown generation: ${genId}`);
   console.log(`co-agent: resumed ${genId}`);
@@ -1132,7 +1214,7 @@ function cmdResume(cli, genId) {
 }
 
 function cmdReset(cli) {
-  const ctx = resolveContext(cli);
+  const ctx = resolveContext(cli, { create: false });
   const old = S.readCurrent(STATE_DIR, ctx.lead.sessionId);
   const id = S.startGeneration(STATE_DIR, ctx.lead.sessionId);
   console.log(`co-agent: archived ${old || '(none)'}, started ${id}`);
@@ -1140,8 +1222,9 @@ function cmdReset(cli) {
 }
 
 function cmdLog(cli) {
-  const ctx = resolveContext(cli);
-  const inbox = S.loadInbox(STATE_DIR, ctx.lead.sessionId, ctx.genId);
+  const ctx = resolveContext(cli, { create: false });
+  if (ctx.noGen) { console.log('no generation yet'); return; }
+  const inbox = S.sortInboxNewestFirst(S.loadInbox(STATE_DIR, ctx.lead.sessionId, ctx.genId));
   if (!inbox.length) { console.log('no consults in this generation'); return; }
   for (const i of inbox) {
     console.log(
@@ -1154,7 +1237,11 @@ function cmdLog(cli) {
 
 function cmdSearch(cli, query) {
   if (!query) fail('usage: coagent search "<query>"');
-  const ctx = resolveContext(cli);
+  const ctx = resolveContext(cli, { create: false });
+  if (ctx.noGen && !S.listGenIds(STATE_DIR, ctx.lead.sessionId).length) {
+    console.log('no matches');
+    return;
+  }
   const hits = S.searchGens(STATE_DIR, ctx.lead.sessionId, query);
   if (!hits.length) { console.log('no matches'); return; }
   for (const h of hits.slice(0, 50)) {
@@ -1164,7 +1251,7 @@ function cmdSearch(cli, query) {
 }
 
 function cmdLead(cli) {
-  const ctx = resolveContext(cli);
+  const ctx = resolveContext(cli, { create: false });
   console.log(JSON.stringify({
     lead: ctx.lead.harness,
     leadSessionId: ctx.lead.sessionId,
@@ -1175,11 +1262,14 @@ function cmdLead(cli) {
     leadModel: ctx.leadModel,
     backend: ctx.backend,
     grokSessionEnv: process.env.GROK_SESSION_ID || null,
+    agent: ctx.agent || null,
+    leadCwd: ctx.leadCwd || null,
   }, null, 2));
 }
 
 function cmdDigest(cli) {
-  const ctx = resolveContext(cli);
+  const ctx = resolveContext(cli, { create: false });
+  if (ctx.noGen) fail('no generation yet (send a message first)');
   const dig = buildDigest(ctx.lead, ctx.genId, ctx.meta.lastUuid || null);
   console.log(`lead=${ctx.lead.harness} backend=${ctx.backend} gen=${ctx.genId} pin=${ctx.lead.pin || '?'}`);
   console.log(`digest: ${dig.digestPath}`);
@@ -1195,14 +1285,16 @@ function cmdDigest(cli) {
 }
 
 function cmdTranscript(cli) {
-  const ctx = resolveContext(cli);
-  const p = findPeerTranscript(ctx.meta.backend || ctx.backend, ctx.meta.sessionId);
+  const ctx = resolveContext(cli, { create: false });
+  if (ctx.noGen) fail('no co-agent transcript yet (send a message first)');
+  const p = findPeerTranscript(ctx.meta.backend || ctx.backend, ctx.meta.sessionId, ctx.leadCwd);
   if (!p) fail('no co-agent transcript yet (send a message first)');
   console.log(p);
 }
 
 function cmdOutbox(cli, args) {
-  const ctx = resolveContext(cli);
+  const ctx = resolveContext(cli, { create: false });
+  if (ctx.noGen) fail('no generation yet (send a message first)');
   const sub = (args[0] || 'list').toLowerCase();
   const dir = outboxDir(ctx.lead.sessionId, ctx.genId);
   if (sub === 'path' || sub === 'dir') { console.log(dir); return; }
@@ -1229,6 +1321,17 @@ function cmdOutbox(cli, args) {
   fail(`unknown outbox subcommand "${sub}" (list | path | cat <file>)`);
 }
 
+function cmdGc(cli) {
+  const ctx = resolveContext(cli, { create: false });
+  const leadSid = ctx.lead.sessionId;
+  let trimmed = 0;
+  for (const id of S.listGenIds(STATE_DIR, leadSid)) {
+    trimmed += S.trimInbox(STATE_DIR, leadSid, id);
+  }
+  const removed = S.gcEmptyGens(STATE_DIR, leadSid);
+  console.log(`co-agent: gc trimmed ${trimmed} inbox row(s), removed ${removed} empty generation(s)`);
+}
+
 function cmdDoctor(cli) {
   const defaultPersona = loadPersona(PERSONA_FILE);
   console.log('coagent doctor');
@@ -1242,14 +1345,15 @@ function cmdDoctor(cli) {
   console.log(`  env GROK_AGENT: ${process.env.GROK_AGENT || '(unset)'}`);
   console.log(`  env GROK_SESSION_ID: ${process.env.GROK_SESSION_ID || '(unset)'}`);
   try {
-    const ctx = resolveContext(cli || {});
+    const ctx = resolveContext(cli || {}, { create: false });
     console.log(`  lead: ${ctx.lead.harness} ${ctx.lead.sessionId}`);
     console.log(`  pin: ${ctx.lead.pin}`);
     console.log(`  lead model: ${ctx.leadModel.modelId || '(unknown)'}${ctx.leadModel.effort ? ` · ${ctx.leadModel.effort}` : ''}`);
     console.log(`  using: ${ctx.backend} ${ctx.model || '(cli default)'} · effort=${ctx.effort}`);
-    console.log(`  generation: ${ctx.genId}`);
+    console.log(`  agent: ${ctx.agent || '(default)'}  cwd: ${ctx.leadCwd || process.cwd()}`);
+    console.log(`  generation: ${ctx.genId || '(none)'}`);
     console.log(`  thread: ${ctx.meta.sessionId || '(none)'}`);
-    console.log(`  queue: ${S.loadInbox(STATE_DIR, ctx.lead.sessionId, ctx.genId).filter((i) => i.status === 'queued' || i.status === 'running').length}`);
+    console.log(`  queue: ${ctx.genId ? S.loadInbox(STATE_DIR, ctx.lead.sessionId, ctx.genId).filter((i) => i.status === 'queued' || i.status === 'running').length : 0}`);
     console.log(`  generations: ${S.listGenIds(STATE_DIR, ctx.lead.sessionId).length}`);
     console.log(`  persona effort (file): ${defaultPersona.effort}`);
   } catch (e) {
@@ -1258,10 +1362,14 @@ function cmdDoctor(cli) {
 }
 
 async function cmdWatch(cli, intervalSec) {
-  const ctx = resolveContext(cli);
+  const ctx = resolveContext(cli, { create: false });
+  if (ctx.noGen) {
+    console.log('co-agent: no thread/transcript yet');
+    return;
+  }
   const { lead, backend, genId, meta } = ctx;
   let b = meta.backend || backend;
-  let p = findPeerTranscript(b, meta.sessionId);
+  let p = findPeerTranscript(b, meta.sessionId, ctx.leadCwd);
   const interval = Math.max(0.2, intervalSec || 1) * 1000;
   const follow = !!cli.follow;
   const deadline = cli.timeoutSec != null && cli.timeoutSec > 0
@@ -1275,16 +1383,16 @@ async function cmdWatch(cli, intervalSec) {
 
   let offset = 0;
   if (p && fs.existsSync(p)) offset = fs.statSync(p).size;
-  console.log(`watching gen ${genId} · ${p || '(waiting)'} · follow=${follow}`);
+  console.error(`watching gen ${genId} · ${p || '(waiting)'} · follow=${follow}`);
 
   while (true) {
     if (deadline && Date.now() > deadline) return;
     const m = S.loadMeta(STATE_DIR, lead.sessionId, genId);
     b = m.backend || backend;
-    p = findPeerTranscript(b, m.sessionId);
+    p = findPeerTranscript(b, m.sessionId, ctx.leadCwd);
     if (p && fs.existsSync(p)) {
       const { lines, size } = peerEventsSince(b, p, offset);
-      for (const ln of lines) console.log(ln);
+      for (const ln of lines) console.error(ln);
       offset = size;
     }
     const busy = S.workerAlive(STATE_DIR, lead.sessionId, genId)
@@ -1292,10 +1400,10 @@ async function cmdWatch(cli, intervalSec) {
     if (!follow && !busy) {
       if (p && fs.existsSync(p)) {
         const { lines, size } = peerEventsSince(b, p, offset);
-        for (const ln of lines) console.log(ln);
+        for (const ln of lines) console.error(ln);
         offset = size;
       }
-      console.log(`\n_(idle · reply: ${lastReplyPath(lead.sessionId, genId)})_`);
+      console.log(`_(idle · reply: ${lastReplyPath(lead.sessionId, genId)})_`);
       return;
     }
     await sleep(interval);
@@ -1369,7 +1477,7 @@ async function main() {
 
   const verbs = new Set([
     'status', 'reset', 'sessions', 'resume', 'log', 'search',
-    'lead', 'digest', 'transcript', 'doctor', 'outbox', 'watch',
+    'lead', 'digest', 'transcript', 'doctor', 'outbox', 'watch', 'gc',
     'ask', 'peers', 'rm', 'bg', 'join', 'jobs',
   ]);
 
@@ -1378,8 +1486,9 @@ async function main() {
   if (verb === 'ask' || verb === 'peers' || verb === 'rm' || verb === 'bg' || verb === 'join' || verb === 'jobs') {
     fail('one standing co-agent now. Send: coagent "…". Fresh tape: coagent reset. Interrupt: coagent --interrupt "…"');
   }
-  if (verb === 'status') return cmdStatus(cli);
+  if (verb === 'status') return await cmdStatus(cli);
   if (verb === 'sessions') return cmdSessions(cli);
+  if (verb === 'gc') return cmdGc(cli);
   if (verb === 'resume') return cmdResume(cli, rest[1]);
   if (verb === 'reset') return cmdReset(cli);
   if (verb === 'log') return cmdLog(cli);
@@ -1408,6 +1517,7 @@ module.exports = {
   buildDigest,
   resolveLead,
   parseModelSpec,
+  parseArgs,
   detectLeadModel,
   digestLib,
   session: S,

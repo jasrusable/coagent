@@ -157,4 +157,22 @@ test('claude events map tool_use', () => {
   assert.ok(events.some((e) => e.kind === 'result'));
 });
 
+test('buildDigestFromRecords includes an inline slice of recent speech', () => {
+  const recs = [
+    { eventId: '1', update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'please fix the widget' } } },
+    { eventId: '2', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'I will look at the widget' } } },
+  ];
+  const d = digest.buildDigestFromRecords({
+    harness: 'grok',
+    records: recs,
+    sinceMarker: null,
+    home: '',
+    outboxIndex: [],
+    transcriptPath: 't',
+  });
+  assert.ok(d.inline, 'expected inline digest');
+  assert.ok(d.inline.includes('widget'), 'inline should contain recent user text');
+  assert.ok(d.inline.length <= digest.INLINE_MAX_CHARS + 10);
+});
+
 if (!process.exitCode) console.log('\nall digest tests passed');
