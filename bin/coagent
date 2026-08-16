@@ -851,8 +851,10 @@ function resolveContext(cli, { create = true } = {}) {
 
 async function reap(leadSid, genId) {
   if (!genId) return;
+  // reapStale only reports an orphan whose pid still matches the process we
+  // spawned, so a recycled pid can't get an unrelated tree killed here.
   const { orphanPid } = S.reapStale(STATE_DIR, leadSid, genId);
-  if (orphanPid && isAlive(orphanPid)) await killTree(orphanPid);
+  if (orphanPid) await killTree(orphanPid);
 }
 
 function buildPrompt({ dig, lead, backend, message, leadSid, genId }) {
@@ -899,13 +901,8 @@ async function runTurn(ctx, item) {
   }
 
   const existing = !!meta.sessionId;
-  const dig = buildDigest(lead, genId, existing ? meta.lastUuid : null);
-  const prompt = buildPrompt({
-    dig, lead, backend, message: item.message, leadSid: mainSid, genId,
-  });
 
   const common = {
-    prompt,
     effort: effort || persona.effort,
     model: model || null,
     permissionMode: persona.permissionMode,
@@ -917,30 +914,40 @@ async function runTurn(ctx, item) {
     cwd: leadCwd || process.cwd(),
   };
 
-  const mkNew = () => {
-    const sid = crypto.randomUUID();
-    const args = backend === 'claude'
-      ? buildClaudeArgs({ ...common, sessionId: sid, resume: false })
-      : buildGrokArgs({ ...common, sessionId: sid, resume: false });
-    return { sid, args };
+  const argsFor = ({ sid, resume, prompt }) => (backend === 'claude'
+    ? buildClaudeArgs({ ...common, prompt, sessionId: sid, resume })
+    : buildGrokArgs({ ...common, prompt, sessionId: sid, resume }));
+
+  const build = (marker) => {
+    const dig = buildDigest(lead, genId, marker);
+    return {
+      dig,
+      prompt: buildPrompt({ dig, lead, backend, message: item.message, leadSid: mainSid, genId }),
+    };
   };
 
+  const mkNew = (prompt) => {
+    const sid = crypto.randomUUID();
+    return { sid, args: argsFor({ sid, resume: false, prompt }) };
+  };
+
+  let built = build(existing ? meta.lastUuid : null);
   let run = existing
-    ? {
-        sid: meta.sessionId,
-        args: backend === 'claude'
-          ? buildClaudeArgs({ ...common, sessionId: meta.sessionId, resume: true })
-          : buildGrokArgs({ ...common, sessionId: meta.sessionId, resume: true }),
-      }
-    : mkNew();
+    ? { sid: meta.sessionId, args: argsFor({ sid: meta.sessionId, resume: true, prompt: built.prompt }) }
+    : mkNew(built.prompt);
 
   const stamp = (sid) => (childPid) => {
     S.writeWorker(STATE_DIR, mainSid, genId, {
       pid: process.pid,
       childPid,
+      childToken: S.pidToken(childPid),
       itemId: item.id,
       sessionId: sid,
     });
+    // An interrupt that lands before the child exists has nothing to kill;
+    // catch it here rather than letting the turn run to completion unread.
+    const now = S.findItem(STATE_DIR, mainSid, genId, item.id);
+    if (now && now.status === 'interrupted') killTree(childPid).catch(() => { /* */ });
   };
 
   const cmd = backend === 'claude' ? 'claude' : 'grok';
@@ -950,17 +957,32 @@ async function runTurn(ctx, item) {
     backend,
     sessionId: sid,
   });
+  // The waiter can abandon an item under us (interrupt, or a --timeout that
+  // SIGTERMs the child). Its non-zero exit is ours, not the backend's — don't
+  // read it as a failed resume and fork the tape.
+  const abandoned = () => {
+    const now = S.findItem(STATE_DIR, mainSid, genId, item.id);
+    return !!now && !S.isLive(now);
+  };
+
   let res = await runCmd(cmd, run.args, runOpts(run.sid));
+  if (abandoned()) return { interrupted: true };
 
-  const latest = S.findItem(STATE_DIR, mainSid, genId, item.id);
-  if (latest && latest.status === 'interrupted') return { interrupted: true };
-
+  let forkedFrom = null;
   if (res.code !== 0 && existing) {
-    const fresh = mkNew();
+    // A fresh tape has seen nothing, so it needs the full digest — handing it
+    // the delta we built for the resumed thread would leave it working blind.
+    const full = build(null);
+    const fresh = mkNew(full.prompt);
+    console.error(`coagent: resume of ${meta.sessionId} failed (exit ${res.code}); starting a new tape ${fresh.sid}`);
     const retry = await runCmd(cmd, fresh.args, runOpts(fresh.sid));
-    const again = S.findItem(STATE_DIR, mainSid, genId, item.id);
-    if (again && again.status === 'interrupted') return { interrupted: true };
-    if (retry.code === 0) { run = fresh; res = retry; }
+    if (abandoned()) return { interrupted: true };
+    if (retry.code === 0) {
+      run = fresh;
+      res = retry;
+      built = full;
+      forkedFrom = meta.sessionId;
+    }
   }
 
   if (res.code !== 0) {
@@ -984,7 +1006,8 @@ async function runTurn(ctx, item) {
     status,
     parsed.stopReason,
     dur,
-    dig.hardFallback && `fallback:${dig.fallbackNote}`,
+    forkedFrom && `NEW TAPE (forked from ${forkedFrom} — colleague lost its memory)`,
+    built.dig.hardFallback && `fallback:${built.dig.fallbackNote}`,
     tpath && `transcript: ${tpath}`,
   ].filter(Boolean).join(' · ');
 
@@ -1000,7 +1023,8 @@ async function runTurn(ctx, item) {
   S.saveMeta(STATE_DIR, mainSid, {
     ...S.loadMeta(STATE_DIR, mainSid, genId),
     sessionId: run.sid,
-    lastUuid: dig.lastMarker || meta.lastUuid || null,
+    forkedFrom: forkedFrom || null,
+    lastUuid: built.dig.lastMarker || meta.lastUuid || null,
     backend,
     model: model || null,
     lastQuestion: item.message,
@@ -1075,9 +1099,31 @@ async function becomeWorkerAndDrain(ctx) {
   return true;
 }
 
-async function waitForItem(leadSid, genId, itemId, timeoutSec, ctx) {
+/**
+ * Runs the queue in the background of the waiter's poll loop. The drain must
+ * never be awaited inline — doing so let a first send (which becomes its own
+ * worker) run unbounded and made --timeout a no-op in the common case.
+ */
+function makeDrainer(ctx) {
+  let active = null;
+  return {
+    start() {
+      if (active || !ctx) return;
+      active = becomeWorkerAndDrain(ctx)
+        .catch((e) => console.error(`coagent: worker error: ${e && e.message ? e.message : e}`))
+        .finally(() => { active = null; });
+    },
+    /** Finish any items we picked up but were not ourselves waiting on. */
+    async settle() {
+      while (active) await active;
+    },
+  };
+}
+
+async function waitForItem(leadSid, genId, itemId, timeoutSec, drainer) {
   const timeoutMs = (timeoutSec != null ? timeoutSec : 600) * 1000;
   const start = Date.now();
+
   while (Date.now() - start < timeoutMs) {
     await reap(leadSid, genId);
     const item = S.findItem(STATE_DIR, leadSid, genId, itemId);
@@ -1085,18 +1131,44 @@ async function waitForItem(leadSid, genId, itemId, timeoutSec, ctx) {
     if (item.status === 'done') return item;
     if (item.status === 'failed') fail(`co-agent failed: ${item.error || 'unknown'}`);
     if (item.status === 'interrupted') fail(`item ${itemId} was interrupted`);
-    if ((item.status === 'queued' || item.status === 'running') && !S.workerAlive(STATE_DIR, leadSid, genId) && ctx) {
-      await becomeWorkerAndDrain(ctx);
-      continue;
-    }
+    if (S.isLive(item) && !S.workerAlive(STATE_DIR, leadSid, genId)) drainer.start();
     await sleep(250);
+  }
+
+  // Settle the item first so the worker sees it was abandoned and doesn't read
+  // our own SIGTERM as a failed resume. A non-waiting kill still checks for a
+  // live child before it looks at item state, so nothing is missed.
+  const w = S.readWorker(STATE_DIR, leadSid, genId);
+  if (w && w.pid === process.pid) {
+    S.updateItem(STATE_DIR, leadSid, genId, itemId, {
+      status: 'failed',
+      finishedAt: new Date().toISOString(),
+      error: `timed out after ${timeoutSec || 600}s`,
+    });
+    await killCurrentChild(leadSid, genId, itemId, { wait: false });
   }
   fail(`timed out after ${timeoutSec || 600}s waiting for item ${itemId}`);
 }
 
-async function killCurrentChild(leadSid, genId) {
-  const w = S.readWorker(STATE_DIR, leadSid, genId);
-  if (w && w.childPid && isAlive(w.childPid)) await killTree(w.childPid);
+/**
+ * The worker stamps childPid only once the child spawns, so an interrupt can
+ * arrive while it is still null. Wait briefly for the pid belonging to *this*
+ * item rather than killing whatever the last stamp happened to leave behind.
+ */
+async function killCurrentChild(leadSid, genId, itemId, { wait = true } = {}) {
+  const deadline = Date.now() + (wait ? 3000 : 0);
+  for (;;) {
+    const w = S.readWorker(STATE_DIR, leadSid, genId);
+    const mine = w && (!itemId || w.itemId === itemId);
+    if (mine && w.childPid && S.tokenAlive(w.childToken || w.childPid)) {
+      await killTree(w.childPid);
+      return true;
+    }
+    const item = itemId ? S.findItem(STATE_DIR, leadSid, genId, itemId) : null;
+    if (item && !S.isLive(item) && item.status !== 'interrupted') return false;
+    if (Date.now() >= deadline) return false;
+    await sleep(100);
+  }
 }
 
 async function cmdSend(message, cli) {
@@ -1107,18 +1179,19 @@ async function cmdSend(message, cli) {
   await reap(mainSid, genId);
 
   if (cli.interrupt) {
-    S.interruptRunning(STATE_DIR, mainSid, genId, { clearQueue: cli.clearQueue });
-    await killCurrentChild(mainSid, genId);
+    const stopped = S.interruptRunning(STATE_DIR, mainSid, genId, { clearQueue: cli.clearQueue });
+    const running = stopped.find((it) => !it.error);
+    await killCurrentChild(mainSid, genId, running && running.id);
   }
 
   const item = S.enqueue(STATE_DIR, mainSid, genId, message, { front: !!cli.interrupt });
-  if (!S.workerAlive(STATE_DIR, mainSid, genId)) {
-    await becomeWorkerAndDrain(ctx);
-  }
-  const done = await waitForItem(mainSid, genId, item.id, cli.timeoutSec, ctx);
+  // The drain runs alongside the poll loop so --timeout can actually bound us.
+  const drainer = makeDrainer(ctx);
+  const done = await waitForItem(mainSid, genId, item.id, cli.timeoutSec, drainer);
   const answer = done.answer || '';
   if (cli.raw) {
     process.stdout.write(answer + (answer.endsWith('\n') ? '' : '\n'));
+    await drainer.settle();
     return;
   }
   const latestMeta = S.readJson(lastReplyMetaPath(mainSid, genId), {});
@@ -1130,6 +1203,9 @@ async function cmdSend(message, cli) {
   }
   if (done.meta) console.log(`\n↳ ${done.meta}`);
   console.log(`↳ reply: ${lastReplyPath(mainSid, genId)}`);
+  // Our answer is out, but we may still be the worker for someone else's
+  // queued item — exiting now would orphan their child mid-turn.
+  await drainer.settle();
 }
 
 async function cmdStatus(cli) {
@@ -1216,6 +1292,10 @@ function cmdResume(cli, genId) {
 function cmdReset(cli) {
   const ctx = resolveContext(cli, { create: false });
   const old = S.readCurrent(STATE_DIR, ctx.lead.sessionId);
+  if (!old) {
+    console.log('co-agent: no generation yet — nothing to archive');
+    return;
+  }
   const id = S.startGeneration(STATE_DIR, ctx.lead.sessionId);
   console.log(`co-agent: archived ${old || '(none)'}, started ${id}`);
   console.log('  old transcript kept. resume it with: coagent resume <id>');
@@ -1245,7 +1325,8 @@ function cmdSearch(cli, query) {
   const hits = S.searchGens(STATE_DIR, ctx.lead.sessionId, query);
   if (!hits.length) { console.log('no matches'); return; }
   for (const h of hits.slice(0, 50)) {
-    console.log(`${h.genId}${h.archived ? ' (archived)' : ''}  ${path.basename(h.file)}:${h.line}  ${h.text}`);
+    const where = h.itemId ? `${h.label}:${h.itemId}` : h.label;
+    console.log(`${h.genId}${h.archived ? ' (archived)' : ''}  ${where}  ${h.text}`);
   }
   if (hits.length > 50) console.log(`… +${hits.length - 50} more`);
 }
