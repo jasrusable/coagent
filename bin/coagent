@@ -1,15 +1,10 @@
 #!/usr/bin/env node
 'use strict';
 
-// coagent — the lead's standing colleague (Claude Code or Grok Build).
+// coagent — the lead agent's inner agent.
 //
-// Stack: human → lead agent → one co-agent per lead session
-//
-// Usage:
-//   coagent [opts] "<message>"        enqueue on the standing thread, wait
-//   coagent [opts] --interrupt "…"    stop the current turn, do this next
-//   coagent status | watch | reset | sessions | resume <id> | log | search
-//   coagent digest | lead | transcript | doctor | outbox
+// you → lead (grok or claude) → inner agent (grok, claude, opus, or fable).
+// Lead harness is derived from the environment. Inner family follows --model.
 
 const fs = require('fs');
 const os = require('os');
@@ -20,37 +15,29 @@ const { spawn, spawnSync } = require('child_process');
 const HOME = os.homedir();
 const ROOT = process.env.COAGENT_HOME || path.join(HOME, '.coagent');
 const PERSONA_FILE = path.join(ROOT, 'persona.md');
-const PERSONAS_DIR = path.join(ROOT, 'personas');
 const STATE_DIR = path.join(ROOT, 'state');
-const CLAUDE_PROJECTS = path.join(HOME, '.claude', 'projects');
-const GROK_HOME = process.env.GROK_HOME || path.join(HOME, '.grok');
-const GROK_SESSIONS = path.join(GROK_HOME, 'sessions');
-const GROK_ACTIVE = path.join(GROK_HOME, 'active_sessions.json');
-const VALID = new Set(['auto', 'claude', 'grok']);
+const DEFAULT_WAIT_SEC = 600;
+const VERBS = new Set([
+  'later', 'stop', 'wait', 'watch', 'log', 'reset', 'sessions', 'resume',
+  'status', 'now', 'doctor', 'help', 'agents', 'notify', 'pings',
+  'ask', 'answer', 'asks',
+]);
+// Well under the harness cap on a single blocking command; past it the worker
+// parks instead and the tape is resumed later.
+const ASK_WAIT_SEC = 90;
+const DEFAULT_AGENT = 'main';
+const MAX_AGENTS = 6;
+const AGENT_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
+const EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 
 function loadLib(name) {
   const installed = path.join(ROOT, 'lib', name);
   if (fs.existsSync(installed)) return require(installed);
   return require(path.join(__dirname, '..', 'lib', name));
 }
-const digestLib = loadLib('digest.js');
 const S = loadLib('session.js');
-
-const INHERITANCE_PREAMBLE = [
-  'You inherit the lead agent\'s full instruction stack (global CLAUDE.md / AGENTS.md and any',
-  'project CLAUDE.md/AGENTS.md, plus whatever the active harness loads) on top of this persona.',
-  'Treat those as shared context — principles, conventions, and project knowledge the lead',
-  'operates under. But they are written addressed to the lead, not you: where they tell "you"',
-  'to consult, loop in, or background a message to the co-agent, that co-agent IS you — you have',
-  'no co-agent of your own to consult, so do not act on those directions. You are the peer',
-  'being referred to; just be that peer.',
-  '',
-  'You are the lead\'s standing colleague — one thread, same workspace. Lead with the bottom',
-  'line; be direct; no filler.',
-  '',
-  'Outbox: for durable work products (long reviews, checklists, findings, plans), write files',
-  'under the outbox directory you are given. Chat reply = short summary + full path(s).',
-].join(' ');
+const R = loadLib('render.js');
+const H = loadLib('harness/index.js');
 
 function fail(msg) {
   const text = `coagent: ${msg}`;
@@ -59,7 +46,6 @@ function fail(msg) {
   process.exit(1);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const isAlive = S.isAlive;
 
 function childPidsOf(pid) {
   try {
@@ -82,51 +68,533 @@ async function killTree(pid) {
     for (const c of childPidsOf(p)) stack.push(c);
   }
   for (const p of all.reverse()) { try { process.kill(p, 'SIGTERM'); } catch { /* */ } }
-  for (let i = 0; i < 30; i++) { if (!all.some(isAlive)) break; await sleep(50); }
+  for (let i = 0; i < 30; i++) { if (!all.some(S.isAlive)) break; await sleep(50); }
   for (const p of all.reverse()) {
-    if (isAlive(p)) { try { process.kill(p, 'SIGKILL'); } catch { /* */ } }
+    if (S.isAlive(p)) { try { process.kill(p, 'SIGKILL'); } catch { /* */ } }
   }
 }
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
-const digestMdPath = (leadSid) => path.join(S.leadDir(STATE_DIR, leadSid), 'context.md');
-const digestJsonPath = (leadSid) => path.join(S.leadDir(STATE_DIR, leadSid), 'context.json');
+function printHelp() {
+  console.log(`coagent — the lead agent's inner agent (one per harness session)
 
-function outboxDir(leadSid, genId, create = true) {
-  const d = path.join(S.genDir(STATE_DIR, leadSid, genId, create), 'outbox');
-  if (create) S.ensureDir(d);
-  return d;
+Usage:
+  coagent "…"                    send (interrupts if busy); returns immediately
+  coagent later "…"              queue for after the current turn
+  coagent stop                   kill the running turn; queue stays
+  coagent wait [--timeout N]     stream until idle; print turns that finished
+  coagent wait <id>              stream until that turn finishes; print it
+  coagent                        snapshot (status + recent consults)
+  coagent log                    consults (your messages + inner replies)
+  coagent watch [-f]             live tail of the inner transcript
+  coagent reset                  new inner session (old tape stays on disk)
+  coagent sessions               inner sessions for this lead
+  coagent resume <id>            make an old inner session current
+
+Colleagues (parallel):
+  coagent @review "…"            address a named colleague (starts one)
+  coagent @review --brief-file b.md   brief from a file (no shell parsing)
+  coagent @review - < b.md       brief from stdin
+  coagent @review "new focus…"   steering: a busy colleague is interrupted
+  coagent agents                 who exists, doing what, elapsed and spend
+  coagent pings                  new worker flags since you last read
+  coagent pings --all            the whole ping log
+  coagent pings --follow         Claude leads: stream live (arm once). Grok leads: skip.
+  coagent asks                   questions workers are blocked on (full text)
+  coagent asks <id>              one question, answered or not
+  coagent answer <id> "…"        unblock one
+  coagent wait --all             wait for every colleague; print as each lands
+
+Inside a worker (only these; the lead's verbs are refused):
+  coagent notify "…"             flag the lead mid-job, without blocking
+  coagent ask "…"                block on a question; prints the answer
+  coagent pings                  what other workers have flagged
+
+Options:
+  --agent, -a   <name>   address a colleague (same as @name; default main)
+  --all                  wait: every colleague, printing each as it settles
+  --model, -m   <id>     this-turn model override
+  --effort, -e  <level>  this-turn effort override (minimal|low|medium|high|xhigh|max)
+  --brief-file <path>    read the message from a file ("-" = stdin)
+  --timeout N            wait N seconds (wait only; default ${DEFAULT_WAIT_SEC})
+  --follow, -f           watch: keep following after idle
+  --help, -h
+
+  Send is background. Ctrl-C on wait/watch does not stop the inner agent.
+  Busy send = steer (interrupt). Use \`later\` to queue.
+  Reset between unrelated jobs. It bypasses approvals; don't walk away
+  from destructive work.
+
+  Prefer --brief-file for anything long: a brief passed as an argument is
+  parsed by your shell first, and backticks in it are command substitution.
+
+  The lead harness is derived from the environment (Grok vs Claude Code).
+  Inner agents can be a different family: \`--model fable\` / \`opus\` /
+  \`claude-*\` drives Claude; \`grok-*\` drives Grok. \`coagent doctor\`
+  shows the lead. Switching family on a colleague starts a new tape.
+
+  Grok leads: use native background agents; do not arm pings --follow.
+  Claude leads: arm \`coagent pings --follow\` once per session.
+
+  @main follows the lead's model and effort unless you pass --model /
+  --effort. Named colleagues can default via persona frontmatter —
+  \`workerModel:\` / \`workerEffort:\` for all of them, \`model.<agent>:\` /
+  \`effort.<agent>:\` for one (cross-family ids are allowed).
+
+Env: COAGENT_HOME, COAGENT_MODEL, COAGENT_EFFORT, COAGENT_WORKER_MODEL,
+     COAGENT_WORKER_EFFORT, COAGENT_LEAD_SESSION_ID, COAGENT_LEAD_TRANSCRIPT,
+     GROK_SESSION_ID, CLAUDE_CODE_SESSION_ID
+Home: ${ROOT}
+`);
 }
 
-function lastReplyPath(leadSid, genId) {
-  return path.join(S.genDir(STATE_DIR, leadSid, genId, false), 'last_reply.md');
-}
-function lastReplyMetaPath(leadSid, genId) {
-  return path.join(S.genDir(STATE_DIR, leadSid, genId, false), 'last_reply.json');
-}
-
-function listOutbox(leadSid, genId) {
-  const dir = outboxDir(leadSid, genId, false);
-  if (!fs.existsSync(dir)) return [];
-  const entries = [];
-  for (const name of fs.readdirSync(dir)) {
-    if (name.startsWith('.')) continue;
-    const p = path.join(dir, name);
-    let st; try { st = fs.statSync(p); } catch { continue; }
-    if (!st.isFile()) continue;
-    entries.push({ name, path: p, size: st.size, mtimeMs: st.mtimeMs, mtime: st.mtime.toISOString() });
+function parseEffort(v, flag) {
+  const effort = String(v || '').trim().toLowerCase();
+  if (!EFFORTS.has(effort)) {
+    fail(`${flag} needs one of ${[...EFFORTS].join(', ')} (got ${v})`);
   }
-  entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return entries;
+  return effort;
 }
 
-function formatOutboxListing(entries, { limit = 20 } = {}) {
-  if (!entries.length) return '(empty)';
-  return entries.slice(0, limit).map((e) => {
-    const kb = e.size < 1024 ? `${e.size}B` : `${(e.size / 1024).toFixed(1)}K`;
-    return `${e.name}  ${kb}  ${ageLabel(e.mtimeMs)}  ${e.path}`;
-  }).join('\n') + (entries.length > limit ? `\n… +${entries.length - limit} more` : '');
+function resolveEffort({ asked, policy, lead, persona }) {
+  return asked || policy || lead || persona || null;
+}
+
+function parseArgs(argv) {
+  let agentName = null;
+  let all = false;
+  let model = null;
+  let effort = null;
+  let follow = false;
+  let timeoutSec = null;
+  let worker = false;
+  let briefFile = null;
+  const rest = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--help' || a === '-h') return { help: true };
+    if (a === '--worker') { worker = true; continue; }
+    if (a === '--all') { all = true; continue; }
+    if (a === '--agent' || a === '-a') {
+      agentName = argv[++i];
+      if (!agentName) fail('--agent needs a name');
+      continue;
+    }
+    if (a.startsWith('--agent=')) { agentName = a.slice(8); continue; }
+    if (a.startsWith('@') && a.length > 1 && !rest.length) { agentName = a.slice(1); continue; }
+    if (a === '--follow' || a === '-f') { follow = true; continue; }
+    if (a === '--model' || a === '-m') {
+      model = argv[++i];
+      if (!model) fail('--model needs a value');
+      continue;
+    }
+    if (a.startsWith('--model=')) { model = a.slice(8); continue; }
+    if (a === '--effort' || a === '-e') {
+      effort = parseEffort(argv[++i], a);
+      continue;
+    }
+    if (a.startsWith('--effort=')) {
+      effort = parseEffort(a.slice(9), '--effort');
+      continue;
+    }
+    // A brief is prose the shell must not touch: backticks in an argv string
+    // are command substitution, so a brief that quotes shell would execute it.
+    if (a === '--brief-file' || a === '--brief') {
+      briefFile = argv[++i];
+      if (!briefFile) fail(`${a} needs a path (or - for stdin)`);
+      continue;
+    }
+    if (a.startsWith('--brief-file=')) { briefFile = a.slice(13); continue; }
+    if (a.startsWith('--brief=')) { briefFile = a.slice(8); continue; }
+    if (a === '-' && briefFile === null) { briefFile = '-'; continue; }
+    if (a === '--timeout') {
+      const v = argv[++i];
+      timeoutSec = parseInt(v, 10);
+      if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) fail(`--timeout needs a positive number (got ${v})`);
+      continue;
+    }
+    if (a.startsWith('--timeout=')) {
+      timeoutSec = parseInt(a.slice(10), 10);
+      if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) fail(`--timeout needs a positive number`);
+      continue;
+    }
+    if (a === '--interrupt' || a === '--clear-queue' || a === '--lead' || a === '-l' || a === '--backend' || a === '-b' || a === '--persona' || a === '--raw' || a === '--peer') {
+      fail(`${a} is gone. Send interrupts if busy; queue with: coagent later "…"`);
+    }
+    if (a.startsWith('-') && a !== '-') fail(`unknown option ${a}`);
+    rest.push(a);
+  }
+  if (agentName && !AGENT_RE.test(agentName)) {
+    fail(`bad agent name ${agentName} — letters, digits, - and _ only`);
+  }
+  return { model, effort, follow, timeoutSec, worker, all, agentName, briefFile, rest };
+}
+
+// Briefs arrive as a file or on stdin so no shell ever parses them.
+function readBrief(spec) {
+  if (spec === '-') {
+    if (process.stdin.isTTY) fail('no stdin to read a brief from — redirect a file, or use --brief-file');
+    let raw;
+    try { raw = fs.readFileSync(0, 'utf8'); } catch { fail('could not read a brief from stdin'); }
+    if (!String(raw).trim()) fail('empty brief on stdin');
+    return String(raw).trim();
+  }
+  if (!fs.existsSync(spec)) fail(`no brief file at ${spec}`);
+  const raw = fs.readFileSync(spec, 'utf8');
+  if (!raw.trim()) fail(`brief file ${spec} is empty`);
+  return raw.trim();
+}
+
+function loadPersona(personaPath) {
+  const p = personaPath || PERSONA_FILE;
+  if (!fs.existsSync(p)) fail(`no persona at ${p}`);
+  const raw = fs.readFileSync(p, 'utf8');
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  const meta = {};
+  let body = raw;
+  if (m) {
+    body = m[2];
+    for (const line of m[1].split('\n')) {
+      const kv = line.match(/^([\w.-]+):\s*(.*)$/);
+      if (kv) meta[kv[1]] = kv[2].trim();
+    }
+  }
+  // `model.<agent>` / `effort.<agent>` are per-colleague policy; workerModel /
+  // workerEffort are the fallback for every named colleague. @main is excluded
+  // on purpose — it is the thinking partner and follows the lead.
+  const byAgent = (prefix) => Object.entries(meta).reduce((acc, [k, v]) => {
+    const m = k.match(new RegExp(`^${prefix}\\.(.+)$`));
+    return m && v ? { ...acc, [m[1]]: v } : acc;
+  }, {});
+  return {
+    path: p,
+    effort: meta.effort || 'high',
+    model: meta.model || null,
+    workerModel: meta.workerModel || null,
+    workerEffort: meta.workerEffort || null,
+    agentModel: byAgent('model'),
+    agentEffort: byAgent('effort'),
+    permissionMode: meta.permissionMode || 'bypassPermissions',
+    persona: body.trim(),
+  };
+}
+
+// Each colleague owns a full copy of the standing-tape machinery — its own
+// meta, inbox, lock and worker — so steering a busy one is the existing
+// interrupt path, not a second execution model.
+function agentKey(leadSessionId, name) {
+  return path.join(leadSessionId, 'agents', name);
+}
+
+function agentsRoot(leadSessionId) {
+  return path.join(STATE_DIR, leadSessionId, 'agents');
+}
+
+function listAgentNames(leadSessionId) {
+  const root = agentsRoot(leadSessionId);
+  if (!fs.existsSync(root)) return [];
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort();
+  } catch { return []; }
+}
+
+// Pre-agents state sat flat in state/<lead>/; move it under agents/main so a
+// session that is mid-conversation keeps its tape.
+function migrateFlatState(leadSessionId) {
+  const flat = path.join(STATE_DIR, leadSessionId);
+  const dest = path.join(flat, 'agents', DEFAULT_AGENT);
+  if (!fs.existsSync(path.join(flat, 'meta.json')) || fs.existsSync(dest)) return;
+  fs.mkdirSync(dest, { recursive: true });
+  for (const f of ['meta.json', 'inbox.json', 'roster.json', 'worker.json', 'worker.lock', 'last_reply.md', 'last_reply.json']) {
+    const from = path.join(flat, f);
+    if (fs.existsSync(from)) {
+      try { fs.renameSync(from, path.join(dest, f)); } catch { /* */ }
+    }
+  }
+}
+
+// A long job's only channel back before it finishes. Deliberately narrow: one
+// append-only stream per lead session, so one watcher covers every worker.
+function pingsPath(leadSessionId) {
+  return path.join(STATE_DIR, leadSessionId, 'pings.jsonl');
+}
+
+// Beside the stream, not in meta.json: pings are per lead session while meta is
+// per colleague, so a cursor in meta would be read once per agent.
+function pingsCursorPath(leadSessionId) {
+  return path.join(STATE_DIR, leadSessionId, 'pings.cursor');
+}
+
+function readPingCursor(leadSessionId, size) {
+  const raw = parseInt(String(readFileOr(pingsCursorPath(leadSessionId), '0')).trim(), 10);
+  const at = Number.isFinite(raw) && raw >= 0 ? raw : 0;
+  return at > size ? 0 : at; // truncated or cleared out from under us
+}
+
+function writePingCursor(leadSessionId, at) {
+  S.atomicWrite(pingsCursorPath(leadSessionId), `${at}\n`);
+}
+
+function readFileOr(p, fallback) {
+  try { return fs.readFileSync(p, 'utf8'); } catch { return fallback; }
+}
+
+function asksDir(pingFile) {
+  return path.join(path.dirname(pingFile), 'asks');
+}
+
+// A heartbeat, not a pidfile: the follower is usually a child of the lead's
+// harness and can die without cleaning up, so freshness is what proves it is
+// still delivering. Nothing reads a stale one as armed.
+function followerPath(leadSessionId) {
+  return path.join(STATE_DIR, leadSessionId, 'pings.follower');
+}
+const FOLLOWER_STALE_MS = 5000;
+
+function beatFollower(leadSessionId) {
+  try { S.atomicWrite(followerPath(leadSessionId), `${process.pid}\n`); } catch { /* */ }
+}
+
+function followerArmed(leadSessionId) {
+  try {
+    const st = fs.statSync(followerPath(leadSessionId));
+    return Date.now() - st.mtimeMs < FOLLOWER_STALE_MS;
+  } catch { return false; }
+}
+
+function appendPing(file, rec) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...rec })}\n`);
+}
+
+// A blocking question. Waits a bounded time for the lead to answer, then tells
+// the worker to park — the tape survives, so the answer can arrive much later.
+async function cmdAsk(cli, question) {
+  const file = process.env.COAGENT_PING_FILE;
+  if (!file) fail('ask is only available inside a co-agent worker');
+  const body = String(question || '').trim();
+  if (!body) fail('usage: coagent ask "…"');
+
+  const from = process.env.COAGENT_PING_FROM || 'worker';
+  const id = S.newId();
+  const dir = asksDir(file);
+  fs.mkdirSync(dir, { recursive: true });
+  S.writeJson(path.join(dir, `${id}.json`), { id, from, question: body, at: new Date().toISOString() });
+  appendPing(file, { from, kind: 'ask', id, text: body });
+
+  const answerFile = path.join(dir, `${id}.answer`);
+  const waitSec = cli.timeoutSec != null ? cli.timeoutSec : ASK_WAIT_SEC;
+  const deadline = Date.now() + waitSec * 1000;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(answerFile)) {
+      console.log(fs.readFileSync(answerFile, 'utf8').trim());
+      return;
+    }
+    await sleep(400);
+  }
+  // Parking is the designed fallback, not a failure — but it needs a distinct
+  // status so a wrapper can branch on more than the message text.
+  S.writeJson(path.join(dir, `${id}.json`), {
+    id, from, question: body, at: new Date().toISOString(), expiredAt: new Date().toISOString(),
+  });
+  console.log(`NO ANSWER YET (${waitSec}s). Do not keep waiting and do not guess: `
+    + `stop now and end your turn stating you are blocked on this question. `
+    + `Your tape is kept — the lead will answer and resume you.`);
+  process.exitCode = 3;
+}
+
+function cmdAnswer(id, text) {
+  const ctx = resolveContext({}, { create: false });
+  const dir = asksDir(pingsPath(ctx.lead.sessionId));
+  const q = path.join(dir, `${id}.json`);
+  if (!fs.existsSync(q)) fail(`unknown question ${id}  (try coagent asks)`);
+  const body = String(text || '').trim();
+  if (!body) fail('usage: coagent answer <id> "…"');
+  S.atomicWrite(path.join(dir, `${id}.answer`), `${body}\n`);
+  console.log(`co-agent: answered ${id}`);
+}
+
+function cmdAsks(cli, id) {
+  const ctx = resolveContext(cli, { create: false });
+  const dir = asksDir(pingsPath(ctx.lead.sessionId));
+  if (!fs.existsSync(dir)) { console.log('no questions'); return; }
+  const answerPath = (q) => path.join(dir, `${q.id}.answer`);
+  const answered = (q) => fs.existsSync(answerPath(q));
+  const all = fs.readdirSync(dir)
+    .filter((f) => f.endsWith('.json'))
+    .map((f) => S.readJson(path.join(dir, f), null))
+    .filter(Boolean)
+    .sort((a, b) => String(a.at || '').localeCompare(String(b.at || '')));
+  // `asks <id>` shows one question answered or not, so a decision can be
+  // audited after the fact; the bare list stays scoped to what is still open.
+  const list = id ? all.filter((q) => q.id === id) : all.filter((q) => !answered(q));
+  if (id && !list.length) fail(`unknown question ${id}`);
+  if (!list.length) { console.log('no open questions'); return; }
+  for (const q of list) {
+    const state = answered(q) ? 'answered' : (q.expiredAt ? 'parked' : 'waiting');
+    console.log(`${q.id}  @${q.from}  ${state}  ${ageLabel(q.at) || ''}`);
+    // Never clipped. A question read at 160 chars gets answered on a guess,
+    // and the guess looks exactly like an answer to the worker.
+    for (const ln of String(q.question || '').split('\n')) console.log(`    ${ln}`);
+    if (answered(q)) {
+      for (const ln of readFileOr(answerPath(q), '').trim().split('\n')) console.log(`    > ${ln}`);
+    } else {
+      console.log(`    answer: coagent answer ${q.id} "…"`);
+    }
+    console.log('');
+  }
+}
+
+// Runs INSIDE a worker, whose env is scrubbed of any lead identity — so the
+// target is handed to it explicitly rather than resolved.
+function cmdNotify(text) {
+  const file = process.env.COAGENT_PING_FILE;
+  if (!file) fail('notify is only available inside a co-agent worker');
+  const body = String(text || '').trim();
+  if (!body) fail('usage: coagent notify "…"');
+  const line = JSON.stringify({
+    at: new Date().toISOString(),
+    from: process.env.COAGENT_PING_FROM || 'worker',
+    text: body,
+  });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${line}\n`);
+  console.log('pinged');
+}
+
+function formatPing(line) {
+  try {
+    const p = JSON.parse(line);
+    return `@${p.from}  ${p.text}`;
+  } catch { return null; }
+}
+
+// --follow is the delivery path: the lead arms it once per session under a
+// per-line watcher, so a worker's ping surfaces while it is still working.
+// Without it, notify only reaches the lead on the next manual pull.
+// Not eventsSince: that skips a leading partial line to resume mid-transcript,
+// but a ping cursor always sits on a newline boundary, so it would eat the
+// first complete ping on every read. Only whole lines count here.
+function readPingsSince(file, offset) {
+  const size = fs.statSync(file).size;
+  if (offset >= size) return { pings: [], next: offset };
+  const fd = fs.openSync(file, 'r');
+  let chunk;
+  try {
+    const buf = Buffer.alloc(size - offset);
+    fs.readSync(fd, buf, 0, buf.length, offset);
+    chunk = buf.toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+  const lastBreak = chunk.lastIndexOf('\n');
+  if (lastBreak < 0) return { pings: [], next: offset }; // a half-written line
+  const complete = chunk.slice(0, lastBreak);
+  const pings = [];
+  for (const line of complete.split('\n')) {
+    if (!line) continue;
+    try { pings.push(JSON.parse(line)); } catch { /* */ }
+  }
+  return { pings, next: offset + Buffer.byteLength(complete, 'utf8') + 1 };
+}
+
+const renderPing = (rec) => {
+  if (!rec || !rec.text) return null;
+  const tag = rec.kind === 'ask' ? `ASK ${rec.id} ` : '';
+  const age = ageLabel(rec.at);
+  return `${age ? `${age}  ` : ''}@${rec.from || 'worker'}  ${tag}${rec.text}`;
+};
+
+async function cmdPings(cli) {
+  // Inside a worker there is no lead to resolve — it would resolve itself.
+  // Workers get the whole shared log and leave the lead's cursor alone.
+  const workerFile = process.env.COAGENT_PING_FILE;
+  if (workerFile) {
+    if (!fs.existsSync(workerFile)) { console.log('no pings'); return; }
+    const me = process.env.COAGENT_PING_FROM || 'worker';
+    const { pings } = readPingsSince(workerFile, 0);
+    const others = pings.filter((x) => x.from !== me);
+    if (!others.length) { console.log('no pings from other workers'); return; }
+    for (const x of others) {
+      const out = renderPing(x);
+      if (out) console.log(out);
+    }
+    return;
+  }
+
+  const ctx = resolveContext(cli, { create: false });
+  const lead = ctx.lead.sessionId;
+  const file = pingsPath(lead);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (!fs.existsSync(file)) fs.writeFileSync(file, '');
+
+  const size = fs.statSync(file).size;
+  // --all rereads the whole log but still leaves the cursor at the end, so the
+  // next plain read is clean.
+  let offset = cli.all ? 0 : readPingCursor(lead, size);
+
+  const flush = () => {
+    const cur = fs.existsSync(file) ? fs.statSync(file).size : 0;
+    if (cur < offset) offset = 0;
+    if (cur <= offset) return 0;
+    const { pings, next } = readPingsSince(file, offset);
+    for (const p of pings) {
+      const out = renderPing(p);
+      if (out) console.log(out);
+    }
+    offset = next;
+    writePingCursor(lead, offset);
+    return pings.length;
+  };
+
+  if (!cli.follow) {
+    const shown = flush();
+    if (!shown) {
+      const total = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).length;
+      console.log(total ? `no new pings (${total} earlier — coagent pings --all)` : 'no pings');
+    }
+    return;
+  }
+
+  // Start from the cursor, not EOF: a ping that landed between dispatching a
+  // worker and arming this watcher would otherwise be lost.
+  flush();
+  beatFollower(lead);
+  try {
+    for (;;) {
+      flush();
+      beatFollower(lead);
+      await sleep(400);
+    }
+  } finally {
+    try { fs.rmSync(followerPath(lead), { force: true }); } catch { /* */ }
+  }
+}
+
+let RESOLVED = null;
+
+function harness() {
+  if (RESOLVED) return RESOLVED;
+  const r = H.resolve();
+  if (r.error) fail(r.error);
+  RESOLVED = r;
+  return r;
+}
+
+function adapter() { return harness().harness; }
+
+function resolveLead() { return harness().lead; }
+
+function sessionPaths(sessionId, cwd) { return adapter().sessionPaths(sessionId, cwd); }
+
+// "for 4m" reads as work in progress where "4m ago" reads as work finished.
+function elapsedLabel(isoOrMs) {
+  const a = ageLabel(isoOrMs);
+  return a ? `for ${a.replace(/ ago$/, '')}` : null;
 }
 
 function ageLabel(isoOrMs) {
@@ -140,520 +608,202 @@ function ageLabel(isoOrMs) {
   return `${Math.round(sec / 86400)}d ago`;
 }
 
-function clip(s, n) {
-  return digestLib.clip(s, n, HOME);
+function buildRules({ personaBody, personaPath, lead, ha, leadHa }) {
+  const leadLabel = (leadHa && leadHa.label) || ha.label;
+  const personaLabel = personaPath || '~/.coagent/persona.md';
+  const family = (leadHa && leadHa.id !== ha.id)
+    ? [`You run as ${ha.label}. The lead is ${leadLabel} and chose this family with --model.`]
+    : [];
+  return [
+    `You are the lead ${leadLabel} agent's co-agent. Reply to the lead, not the user.`,
+    ...family,
+    `You ARE the co-agent. You have no co-agent of your own — the ONLY coagent command you may run is \`coagent notify\`.`,
+    ``,
+    `You have three commands, all scarce:`,
+    `  \`coagent notify "…"\` — tell the lead something mid-job. Use it when you find something that changes what should happen next. Never for progress or narration; your final answer covers that.`,
+    `  \`coagent ask "…"\` — ask a question and WAIT for the answer. Use it when you are blocked and guessing would waste the work. If it returns "NO ANSWER YET", stop immediately and end your turn saying what you are blocked on — do not keep polling and do not guess. Your tape is kept and you will be resumed with the answer.`,
+    `  \`coagent pings\` — read what other workers have flagged. Check it before duplicating an investigation someone else has already done.`,
+    ``,
+    `Lead session: ${lead.sessionId}`,
+    ...ha.rulesLines(lead),
+    ``,
+    `Persona (${personaLabel}):`,
+    personaBody,
+  ].join('\n');
 }
 
-function printHelp() {
-  console.log(`coagent — the lead's standing colleague (one per harness session)
-
-Usage:
-  coagent [opts] "<message>"              enqueue, wait for this reply (resumes)
-  coagent [opts] --interrupt "<message>"  stop the current turn, do this next
-  coagent status                          current gen, queue, last reply
-  coagent watch [-f] [--timeout N]        live tail of the colleague
-  coagent reset                           archive this gen, start a fresh transcript
-  coagent sessions                        list generations
-  coagent resume <id>                     make an old gen current
-  coagent log                             consults in the current gen (newest first)
-  coagent search "<query>"                search this session's generations
-  coagent gc                              drop empty archived gens; trim old inbox rows
-  coagent digest | lead | transcript | doctor | outbox
-
-Options:
-  --lead, -l    auto|claude|grok
-  --model, -m   <spec>     this-turn override (claude, grok, grok-4.6, claude/opus, …)
-                           default: the lead's current model
-  --persona     <name|path>
-  --clear-queue            with --interrupt: drop remaining queued items
-  --raw                    print answer body only
-  --timeout N              wait N seconds (default 600)
-  --follow, -f             watch: keep following
-  --help, -h
-
-  A send blocks until this reply. Progress (and watch) stream on stderr.
-  For a long review, background the command in your harness and keep working.
-  A failed turn does not stop later queued messages.
-
-  (--peer / ask / --backend are rejected)
-
-Env: COAGENT_HOME, COAGENT_MODEL, COAGENT_LEAD, COAGENT_PERSONA,
-     COAGENT_LEAD_TRANSCRIPT, COAGENT_LEAD_SESSION_ID,
-     GROK_SESSION_ID, CLAUDE_CODE_SESSION_ID
-Home: ${ROOT}
-`);
-}
-
-function parseArgs(argv) {
-  let lead = null;
-  let modelSpec = null;
-  let persona = null;
-  let follow = false;
-  let raw = false;
-  let interrupt = false;
-  let clearQueue = false;
-  let timeoutSec = null;
-  const rest = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--help' || a === '-h') return { help: true };
-    if (a === '--backend' || a === '-b' || a.startsWith('--backend=')) {
-      fail('use --model instead of --backend (e.g. --model grok-4.6 or --model claude)');
-    }
-    if (a === '--peer' || a.startsWith('--peer=')) {
-      fail('one co-agent per lead session. Resume: coagent "…". Fresh tape: coagent reset');
-    }
-    if (a === '--lead' || a === '-l') { lead = argv[++i]; continue; }
-    if (a.startsWith('--lead=')) { lead = a.slice(7); continue; }
-    if (a === '--model' || a === '-m') { modelSpec = argv[++i]; continue; }
-    if (a.startsWith('--model=')) { modelSpec = a.slice(8); continue; }
-    if (a === '--persona') { persona = argv[++i]; continue; }
-    if (a.startsWith('--persona=')) { persona = a.slice(10); continue; }
-    if (a === '--interrupt') { interrupt = true; continue; }
-    if (a === '--clear-queue') { clearQueue = true; continue; }
-    if (a === '--follow' || a === '-f') { follow = true; continue; }
-    if (a === '--raw') { raw = true; continue; }
-    if (a === '--timeout') { timeoutSec = Number(argv[++i]); continue; }
-    if (a.startsWith('--timeout=')) { timeoutSec = Number(a.slice(10)); continue; }
-    if (a === '--parallel' || a === '--save') {
-      fail(`${a} is gone. Messages resume the standing thread; --model/--persona apply to this turn`);
-    }
-    if (a.startsWith('-') && a !== '-') fail(`unknown option ${a} (try --help)`);
-    rest.push(a);
-  }
-  if (timeoutSec != null && !(timeoutSec > 0)) {
-    fail('--timeout must be a positive number of seconds');
-  }
-  return { lead, modelSpec, persona, follow, raw, interrupt, clearQueue, timeoutSec, rest };
-}
-
-function normalizeChoice(v, label) {
-  if (v == null || v === '') return 'auto';
-  const n = String(v).toLowerCase().trim();
-  if (!VALID.has(n)) fail(`${label} must be auto|claude|grok (got ${v})`);
-  return n;
-}
-
-/** backend/id, harness name, or a raw model id (grok-4.6, claude-opus-…). */
-function parseModelSpec(spec) {
-  if (spec == null || spec === '') {
-    return { backendChoice: null, modelId: null, raw: null };
-  }
-  const s = String(spec).trim();
-  if (!s) return { backendChoice: null, modelId: null, raw: null };
-
-  if (s.includes('/')) {
-    const i = s.indexOf('/');
-    const be = s.slice(0, i).trim();
-    const modelId = s.slice(i + 1).trim() || null;
-    const backendChoice = normalizeChoice(be, '--model backend');
-    if (backendChoice === 'auto') fail('--model auto/… is not valid; use claude/… or grok/…');
-    if (!modelId) fail(`--model ${s}: missing model id after /`);
-    return { backendChoice, modelId, raw: s };
-  }
-
-  const lower = s.toLowerCase();
-  if (VALID.has(lower)) {
-    return { backendChoice: normalizeChoice(s, '--model'), modelId: null, raw: s };
-  }
-  const backendChoice = lower.startsWith('claude') ? 'claude'
-    : (lower.startsWith('grok') ? 'grok' : null);
-  return { backendChoice, modelId: s, raw: s };
-}
-
-function resolvePersonaPath(flagOrSticky) {
-  if (!flagOrSticky) return PERSONA_FILE;
-  const v = String(flagOrSticky).trim();
-  if (!v) return PERSONA_FILE;
-  if (v.startsWith('/') || v.startsWith('~') || v.includes('/')) {
-    return v.startsWith('~') ? path.join(HOME, v.slice(1)) : v;
-  }
-  const candidates = [
-    path.join(PERSONAS_DIR, `${v}.md`),
-    path.join(PERSONAS_DIR, v),
-    path.join(ROOT, `${v}.md`),
-    v,
-  ];
-  for (const c of candidates) {
-    if (fs.existsSync(c)) return c;
-  }
-  fail(`persona not found: ${v} (tried ${candidates.slice(0, 3).join(', ')})`);
-}
-
-function loadPersona(personaPath) {
-  const p = personaPath || PERSONA_FILE;
-  if (!fs.existsSync(p)) fail(`no persona at ${p}`);
-  const raw = fs.readFileSync(p, 'utf8');
-  const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
-  const meta = {};
-  let body = raw;
-  if (m) {
-    body = m[2];
-    for (const line of m[1].split('\n')) {
-      const kv = line.match(/^(\w+):\s*(.*)$/);
-      if (kv) meta[kv[1]] = kv[2].trim();
-    }
-  }
-  return {
-    path: p,
-    effort: meta.effort || 'high',
-    model: meta.model || null,
-    backend: meta.backend || null,
-    lead: meta.lead || null,
-    permissionMode: meta.permissionMode || 'bypassPermissions',
-    allowedTools: meta.allowedTools || null,
-    disallowedTools: meta.disallowedTools || null,
-    mcp: meta.mcp || 'on',
-    persona: body.trim(),
-  };
-}
-
-function ancestorPids() {
-  const out = [];
-  let pid = process.pid;
-  for (let i = 0; i < 48; i++) {
-    out.push(pid);
-    let ppid;
-    try {
-      const r = spawnSync('ps', ['-p', String(pid), '-o', 'ppid='], { encoding: 'utf8' });
-      ppid = parseInt(String(r.stdout || '').trim(), 10);
-    } catch { break; }
-    if (!Number.isFinite(ppid) || ppid <= 1 || ppid === pid) break;
-    pid = ppid;
-  }
-  return out;
-}
-
-function findClaudeTranscriptBySid(sid) {
-  if (!sid || !fs.existsSync(CLAUDE_PROJECTS)) return null;
-  for (const d of fs.readdirSync(CLAUDE_PROJECTS)) {
-    const t = path.join(CLAUDE_PROJECTS, d, `${sid}.jsonl`);
-    if (fs.existsSync(t)) return t;
-  }
-  return null;
-}
-
-function claudeProjectDirForCwd(cwd) {
-  if (!cwd || !fs.existsSync(CLAUDE_PROJECTS)) return null;
-  const slug = cwd.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  const exact = path.join(CLAUDE_PROJECTS, slug);
-  if (fs.existsSync(exact)) return exact;
-  const dashed = cwd.replace(/^\//, '').replace(/\//g, '-');
-  const p = path.join(CLAUDE_PROJECTS, dashed);
-  if (fs.existsSync(p)) return p;
-  return null;
-}
-
-function findClaudeTranscriptByCwd() {
-  const dir = claudeProjectDirForCwd(process.cwd());
-  if (!dir) return null;
-  let best = null;
-  let bestM = 0;
-  for (const f of fs.readdirSync(dir)) {
-    if (!f.endsWith('.jsonl')) continue;
-    const t = path.join(dir, f);
-    try {
-      const m = fs.statSync(t).mtimeMs;
-      if (m > bestM) { bestM = m; best = t; }
-    } catch { /* */ }
-  }
-  return best;
-}
-
-function resolveClaudeLead(explicitSid) {
-  const sid = explicitSid || process.env.CLAUDE_CODE_SESSION_ID || null;
-  if (sid) {
-    const t = findClaudeTranscriptBySid(sid);
-    if (t) return { harness: 'claude', sessionId: sid, transcriptPath: t, pin: 'env' };
-  }
-  const t = findClaudeTranscriptByCwd();
-  if (t) {
-    return {
-      harness: 'claude',
-      sessionId: path.basename(t).replace(/\.jsonl$/, ''),
-      transcriptPath: t,
-      pin: 'cwd-mtime',
-    };
-  }
-  return null;
-}
-
-function encodeGrokCwd(cwd) { return encodeURIComponent(cwd); }
-
-function grokSessionDir(sessionId, cwd) {
-  if (cwd) {
-    const p = path.join(GROK_SESSIONS, encodeGrokCwd(cwd), sessionId);
-    if (fs.existsSync(p)) return p;
-  }
-  if (!fs.existsSync(GROK_SESSIONS)) return null;
-  for (const d of fs.readdirSync(GROK_SESSIONS)) {
-    const p = path.join(GROK_SESSIONS, d, sessionId);
-    if (fs.existsSync(p)) return p;
-  }
-  return null;
-}
-
-function readGrokActive() {
-  if (!fs.existsSync(GROK_ACTIVE)) return [];
-  try {
-    const raw = JSON.parse(fs.readFileSync(GROK_ACTIVE, 'utf8'));
-    return Array.isArray(raw) ? raw : (raw.sessions || []);
-  } catch { return []; }
-}
-
-function cwdChain() {
-  const chain = [];
-  let cur = process.cwd();
-  for (let i = 0; i < 20; i++) {
-    chain.push(cur);
-    const parent = path.dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
-  return chain;
-}
-
-function injectGrokSessionEnv(sessionId) {
-  if (!sessionId) return;
-  if (!process.env.GROK_SESSION_ID) process.env.GROK_SESSION_ID = sessionId;
-  if (!process.env.COAGENT_LEAD_SESSION_ID) process.env.COAGENT_LEAD_SESSION_ID = sessionId;
-}
-
-function resolveGrokLead(explicitSid) {
-  const envSid = explicitSid || process.env.GROK_SESSION_ID || process.env.COAGENT_LEAD_SESSION_ID || null;
-  if (envSid) {
-    const dir = grokSessionDir(envSid, process.cwd()) || grokSessionDir(envSid);
-    if (dir) {
-      injectGrokSessionEnv(envSid);
-      return {
-        harness: 'grok',
-        sessionId: envSid,
-        transcriptPath: path.join(dir, 'updates.jsonl'),
-        pin: process.env.GROK_SESSION_ID === envSid ? 'env' : 'coagent-env',
-        sessionDir: dir,
-      };
-    }
-  }
-
-  const active = readGrokActive();
-  const ancestors = new Set(ancestorPids());
-  const byAncestor = active
-    .filter((s) => s && s.session_id && s.pid && ancestors.has(s.pid) && isAlive(s.pid));
-  if (byAncestor.length > 1) {
-    fail(`ambiguous Grok lead: ${byAncestor.length} sessions in ancestry`);
-  }
-  if (byAncestor.length === 1) {
-    const s = byAncestor[0];
-    const dir = grokSessionDir(s.session_id, s.cwd);
-    if (dir) {
-      injectGrokSessionEnv(s.session_id);
-      return {
-        harness: 'grok',
-        sessionId: s.session_id,
-        transcriptPath: path.join(dir, 'updates.jsonl'),
-        pin: 'ancestor-pid',
-        sessionDir: dir,
-      };
-    }
-  }
-
-  const chain = cwdChain();
-  const byCwd = active
-    .filter((s) => s && s.session_id && s.cwd && chain.includes(s.cwd) && (!s.pid || isAlive(s.pid)));
-  if (byCwd.length > 1) {
-    fail(`ambiguous Grok lead: ${byCwd.length} active sessions for this cwd`);
-  }
-  if (byCwd.length === 1) {
-    const s = byCwd[0];
-    const dir = grokSessionDir(s.session_id, s.cwd);
-    if (dir) {
-      injectGrokSessionEnv(s.session_id);
-      return {
-        harness: 'grok',
-        sessionId: s.session_id,
-        transcriptPath: path.join(dir, 'updates.jsonl'),
-        pin: 'cwd-active',
-        sessionDir: dir,
-      };
-    }
-  }
-  return null;
-}
-
-function leadFromExplicitTranscript(transcriptPath) {
-  if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
-  if (transcriptPath.includes(`${path.sep}updates.jsonl`) || transcriptPath.endsWith('updates.jsonl')) {
-    const sessionId = path.basename(path.dirname(transcriptPath));
-    injectGrokSessionEnv(sessionId);
-    return {
-      harness: 'grok',
-      sessionId,
-      transcriptPath,
-      pin: 'explicit-path',
-      sessionDir: path.dirname(transcriptPath),
-    };
-  }
-  if (transcriptPath.endsWith('.jsonl')) {
-    return {
-      harness: 'claude',
-      sessionId: path.basename(transcriptPath).replace(/\.jsonl$/, ''),
-      transcriptPath,
-      pin: 'explicit-path',
-    };
-  }
-  return null;
-}
-
-function resolveLead(leadChoice) {
-  const explicit = process.env.COAGENT_LEAD_TRANSCRIPT || process.env.PANEL_TRANSCRIPT || null;
-  if (explicit) {
-    const L = leadFromExplicitTranscript(explicit);
-    if (L) return L;
-  }
-  const sidHint = process.env.COAGENT_LEAD_SESSION_ID || null;
-
-  if (leadChoice === 'claude') {
-    const L = resolveClaudeLead(sidHint);
-    if (L) return L;
-  }
-  if (leadChoice === 'grok') {
-    const L = resolveGrokLead(sidHint || process.env.GROK_SESSION_ID);
-    if (L) return L;
-  }
-  if (leadChoice === 'auto') {
-    if (process.env.CLAUDE_CODE_SESSION_ID) {
-      const L = resolveClaudeLead(process.env.CLAUDE_CODE_SESSION_ID);
-      if (L) return L;
-    }
-    if (process.env.GROK_SESSION_ID) {
-      const L = resolveGrokLead(process.env.GROK_SESSION_ID);
-      if (L) return L;
-    }
-    if (process.env.GROK_AGENT) {
-      const L = resolveGrokLead(null);
-      if (L) return L;
-    }
-    const g = resolveGrokLead(null);
-    if (g) return g;
-    const c = resolveClaudeLead(null);
-    if (c) return c;
-  }
-  fail('no lead conversation found. Need GROK_SESSION_ID or CLAUDE_CODE_SESSION_ID.');
-}
-
-function loadClaudeRecords(transcriptPath) {
-  if (!transcriptPath || !fs.existsSync(transcriptPath)) return [];
-  const out = [];
-  for (const line of fs.readFileSync(transcriptPath, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { /* */ }
-  }
-  return out;
-}
-
-function loadGrokUpdates(transcriptPath) {
-  if (!transcriptPath || !fs.existsSync(transcriptPath)) return [];
-  const out = [];
-  for (const line of fs.readFileSync(transcriptPath, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const o = JSON.parse(line);
-      if (o.method !== 'session/update' && o.method !== '_x.ai/session/update') continue;
-      const params = o.params || {};
-      const meta = params._meta || {};
-      out.push({
-        eventId: meta.eventId || o.eventId || null,
-        update: params.update || {},
-        timestamp: o.timestamp,
-        method: o.method,
-      });
-    } catch { /* */ }
-  }
-  return out;
-}
-
-function detectLeadModel(lead) {
-  if (lead.harness === 'grok') {
-    const dir = lead.sessionDir || grokSessionDir(lead.sessionId, process.cwd()) || grokSessionDir(lead.sessionId);
-    return S.detectGrokLeadModel(dir);
-  }
-  return S.detectClaudeLeadModel(loadClaudeRecords(lead.transcriptPath));
-}
-
-function buildDigest(lead, genId, sinceMarker) {
-  const records = lead.harness === 'claude'
-    ? loadClaudeRecords(lead.transcriptPath)
-    : loadGrokUpdates(lead.transcriptPath);
-
-  const result = digestLib.buildDigestFromRecords({
-    harness: lead.harness,
-    records,
-    sinceMarker,
-    home: HOME,
-    outboxIndex: listOutbox(lead.sessionId, genId).map((e) => ({
-      name: e.name, size: e.size, mtime: e.mtime, path: e.path,
-    })),
-    transcriptPath: lead.transcriptPath,
-    pin: lead.pin || null,
-  });
-
-  const digestPath = digestMdPath(lead.sessionId);
-  const jsonPath = digestJsonPath(lead.sessionId);
-  S.atomicWrite(digestPath, result.markdown);
-  S.writeJson(jsonPath, {
-    lead: lead.harness,
-    sessionId: lead.sessionId,
-    pin: lead.pin || null,
-    transcriptPath: lead.transcriptPath,
-    genId,
-    isDelta: result.isDelta,
-    lastMarker: result.lastMarker,
-    sinceMarker: sinceMarker || null,
-    fallbackNote: result.fallbackNote || null,
-    snapshot: result.side,
-    outbox: result.side.outbox || [],
-    updatedAt: new Date().toISOString(),
-  });
-
-  return {
-    digestPath,
-    jsonPath,
-    lastMarker: result.lastMarker,
-    isDelta: result.isDelta,
-    side: result.side,
-    inline: result.inline || '',
-    fallbackNote: result.fallbackNote,
-    hardFallback: result.hardFallback,
-  };
-}
-
-function childEnv() {
+function childEnv({ pingFile, pingFrom } = {}) {
   const env = { ...process.env };
-  delete env.GROK_AGENT;
   delete env.COAGENT_BG_WORKER;
-  delete env.GROK_SESSION_ID;
-  delete env.CLAUDE_CODE_SESSION_ID;
+  delete env.COAGENT_HARNESS;
+  delete env.COAGENT_LEAD_SESSION_ID;
+  delete env.COAGENT_LEAD_TRANSCRIPT;
+  delete env.COAGENT_AGENT;
+  for (const a of H.ADAPTERS) a.scrubEnv(env);
+  if (pingFile) {
+    env.COAGENT_PING_FILE = pingFile;
+    env.COAGENT_PING_FROM = pingFrom || 'worker';
+  }
   return env;
 }
 
-function runCmd(cmd, args, { onSpawn, cwd, backend, sessionId } = {}) {
+function parseResult(out) {
+  let answer = (out || '').trim();
+  let sessionId = null;
+  let durMs = null;
+  let costUsd = null;
+  let numTurns = null;
+  let isError = false;
+  let stopReason = null;
+  try {
+    const j = JSON.parse(out);
+    let text = j.result || j.answer || j.text || null;
+    if (!text && j.message) {
+      text = typeof j.message === 'string' ? j.message
+        : (j.message.content || j.message.text || null);
+    }
+    if (text != null) answer = typeof text === 'string' ? text : JSON.stringify(text);
+    sessionId = j.sessionId || j.session_id || null;
+    isError = !!j.isError || !!j.is_error;
+    durMs = j.durationMs || j.duration_ms || null;
+    costUsd = j.totalCostUsd != null ? j.totalCostUsd : (j.total_cost_usd != null ? j.total_cost_usd : null);
+    numTurns = j.numTurns != null ? j.numTurns : (j.num_turns != null ? j.num_turns : null);
+    stopReason = j.stopReason || j.stop_reason || null;
+  } catch { /* plain text */ }
+  return { answer, sessionId, durMs, costUsd, numTurns, isError, stopReason };
+}
+
+function resolveContext(cli, { create = true } = {}) {
+  const persona = loadPersona(PERSONA_FILE);
+  const leadHa = adapter();
+  const lead = resolveLead();
+  migrateFlatState(lead.sessionId);
+  const agentName = cli.agentName || process.env.COAGENT_AGENT || DEFAULT_AGENT;
+  const key = agentKey(lead.sessionId, agentName);
+  if (create) {
+    const known = listAgentNames(lead.sessionId);
+    if (!known.includes(agentName) && known.length >= MAX_AGENTS) {
+      fail(`already running ${known.length} colleagues (${known.join(', ')}) — max ${MAX_AGENTS}. Reset or reuse one.`);
+    }
+    S.ensureLead(STATE_DIR, key);
+  }
+  const meta = S.loadMeta(STATE_DIR, key);
+  const leadModel = leadHa.describeSession({
+    dir: lead.sessionDir,
+    transcript: lead.transcriptPath,
+  });
+  const asked = cli.model || process.env.COAGENT_MODEL || null;
+  if (asked && !H.adapterForModel(asked)) {
+    fail(`unknown model ${asked} — use a grok, claude, opus, sonnet, haiku, or fable id`);
+  }
+  const askedEffortRaw = cli.effort || process.env.COAGENT_EFFORT || null;
+  const askedEffort = askedEffortRaw ? parseEffort(askedEffortRaw, '--effort') : null;
+  // Named colleagues are fan-out: a diff-and-grep worker inheriting the lead's
+  // top model at high effort is pure cost. Policy beats inheritance for them,
+  // and only for them — @main still follows the lead unless --model / --effort
+  // is set.
+  const isColleague = agentName !== DEFAULT_AGENT;
+  const policyModel = isColleague
+    ? (persona.agentModel[agentName] || process.env.COAGENT_WORKER_MODEL || persona.workerModel || null)
+    : null;
+  if (policyModel && !H.adapterForModel(policyModel)) {
+    fail(`unknown worker model ${policyModel} — use a grok, claude, opus, sonnet, haiku, or fable id`);
+  }
+  const policyEffort = isColleague
+    ? (persona.agentEffort[agentName] || process.env.COAGENT_WORKER_EFFORT || persona.workerEffort || null)
+    : null;
+  const inferred = leadHa.acceptsModel(leadModel.modelId) ? leadModel.modelId : null;
+  const model = asked || policyModel || inferred || persona.model || null;
+  const ha = (asked && H.adapterForModel(asked))
+    || (policyModel && !asked && H.adapterForModel(policyModel))
+    || (meta.harness && H.byId(meta.harness))
+    || (model && H.adapterForModel(model))
+    || leadHa;
+  const effort = resolveEffort({
+    asked: askedEffort,
+    policy: policyEffort,
+    lead: leadModel.effort,
+    persona: persona.effort,
+  });
+  const leadCwd = leadModel.cwd || process.cwd();
+  // Grok's `grok-build-plan` is not a Claude agent. Only forward --agent
+  // when the inner family is the lead's.
+  const agent = (ha.id === leadHa.id ? leadModel.agent : null) || null;
+  return {
+    persona,
+    ha,
+    leadHa,
+    lead,
+    agentName,
+    key,
+    meta,
+    leadModel,
+    model,
+    effort,
+    leadCwd,
+    agent,
+    permissionMode: persona.permissionMode,
+  };
+}
+
+function writeReplyFiles(key, { answer, meta, message, sessionId, itemId }) {
+  const body = `${answer || ''}${meta ? `\n\n↳ ${meta}` : ''}\n`;
+  S.atomicWrite(S.lastReplyPath(STATE_DIR, key), body);
+  S.writeJson(S.lastReplyMetaPath(STATE_DIR, key), {
+    answer: answer || '',
+    meta: meta || null,
+    message: message || null,
+    sessionId: sessionId || null,
+    itemId: itemId || null,
+    at: new Date().toISOString(),
+  });
+}
+
+function eventsSince(filePath, sinceByte, format) {
+  if (!filePath || !fs.existsSync(filePath)) return { lines: [], size: 0 };
+  const st = fs.statSync(filePath);
+  const size = st.size;
+  if (sinceByte >= size) return { lines: [], size };
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const len = size - sinceByte;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, sinceByte);
+    let chunk = buf.toString('utf8');
+    if (sinceByte > 0 && !chunk.startsWith('\n') && chunk.includes('\n')) {
+      chunk = chunk.slice(chunk.indexOf('\n') + 1);
+    }
+    const lines = [];
+    for (const line of chunk.split('\n').filter(Boolean)) {
+      let rec;
+      try { rec = JSON.parse(line); } catch { continue; }
+      const formatted = format(rec);
+      if (formatted) lines.push(formatted);
+    }
+    return { lines, size };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function runCmd(cmd, args, { onSpawn, cwd, sessionId, ha, ping }) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, {
       cwd: cwd || process.cwd(),
-      env: childEnv(),
+      env: childEnv(ping),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     if (onSpawn) onSpawn(child.pid);
     let out = '';
     let err = '';
     let offset = 0;
-    const existingTape = sessionId && findPeerTranscript(backend, sessionId, cwd);
-    if (existingTape && fs.existsSync(existingTape)) offset = fs.statSync(existingTape).size;
+    const existing = sessionId && ha.sessionPaths(sessionId, cwd).transcript;
+    if (existing && fs.existsSync(existing)) offset = fs.statSync(existing).size;
     const pump = () => {
       if (!sessionId) return;
-      const tpath = findPeerTranscript(backend, sessionId, cwd);
-      if (!tpath) return;
-      const { lines, size } = peerEventsSince(backend, tpath, offset);
+      const tpath = ha.sessionPaths(sessionId, cwd).transcript;
+      if (!tpath || !fs.existsSync(tpath)) return;
+      const { lines, size } = eventsSince(tpath, offset, (rec) => ha.formatUpdate(rec, HOME));
       for (const ln of lines) console.error(ln);
       offset = size;
     };
@@ -668,319 +818,97 @@ function runCmd(cmd, args, { onSpawn, cwd, backend, sessionId } = {}) {
   });
 }
 
-function parsePeerResult(backend, out) {
-  let answer = (out || '').trim();
-  let sessionId = null;
-  let durMs = null;
-  let subtype = null;
-  let stopReason = null;
-  let isError = false;
-  try {
-    const j = JSON.parse(out);
-    if (backend === 'claude') {
-      answer = j.result || j.answer || answer;
-      sessionId = j.session_id || j.sessionId || null;
-      subtype = j.subtype || null;
-      isError = !!j.is_error;
-      durMs = j.duration_ms || null;
-      stopReason = j.stop_reason || null;
-    } else {
-      let text = j.result || j.answer || j.text || null;
-      if (!text && j.message) {
-        text = typeof j.message === 'string' ? j.message
-          : (j.message.content || j.message.text || null);
-      }
-      if (text != null) answer = typeof text === 'string' ? text : JSON.stringify(text);
-      sessionId = j.sessionId || j.session_id || null;
-      subtype = j.subtype || j.stopReason || null;
-      isError = !!j.isError || !!j.is_error;
-      durMs = j.durationMs || j.duration_ms || null;
-      stopReason = j.stopReason || j.stop_reason || null;
-    }
-  } catch { /* plain text */ }
-  return { answer, sessionId, durMs, subtype, stopReason, isError };
-}
-
-function systemBundle(personaBody) {
-  return `${INHERITANCE_PREAMBLE}\n\n${personaBody}`;
-}
-
-function buildClaudeArgs({ prompt, effort, model, permissionMode, allowedTools, disallowedTools, mcp, persona, sessionId, resume }) {
-  const base = [
-    '-p', prompt,
-    '--output-format', 'json',
-    '--effort', effort,
-    '--permission-mode', permissionMode,
-    '--add-dir', STATE_DIR,
-  ];
-  if (allowedTools) base.push('--allowedTools', ...allowedTools.split(/[\s,]+/).filter(Boolean));
-  if (disallowedTools) base.push('--disallowedTools', ...disallowedTools.split(/[\s,]+/).filter(Boolean));
-  if (mcp === 'off') base.push('--strict-mcp-config');
-  if (model) base.push('--model', model);
-  if (resume) return [...base, '--resume', sessionId];
-  return [...base, '--session-id', sessionId, '--append-system-prompt', systemBundle(persona)];
-}
-
-function buildGrokArgs({ prompt, effort, model, permissionMode, allowedTools, disallowedTools, persona, sessionId, resume, agent, cwd }) {
-  const base = [
-    '-p', prompt,
-    '--output-format', 'json',
-    '--effort', effort,
-    '--permission-mode', permissionMode,
-    '--always-approve',
-    '--rules', systemBundle(persona),
-  ];
-  if (allowedTools) base.push('--tools', allowedTools.split(/[\s,]+/).filter(Boolean).join(','));
-  if (disallowedTools) base.push('--disallowed-tools', disallowedTools.split(/[\s,]+/).filter(Boolean).join(','));
-  if (model) base.push('--model', model);
-  if (agent) base.push('--agent', agent);
-  if (cwd) base.push('--cwd', cwd);
-  if (resume) return [...base, '--resume', sessionId];
-  return [...base, '--session-id', sessionId];
-}
-
-function findPeerTranscript(backend, peerSessionId, cwd) {
-  if (!peerSessionId) return null;
-  if (backend === 'claude') {
-    if (!fs.existsSync(CLAUDE_PROJECTS)) return null;
-    return fs.readdirSync(CLAUDE_PROJECTS)
-      .map((d) => path.join(CLAUDE_PROJECTS, d, `${peerSessionId}.jsonl`))
-      .find((p) => fs.existsSync(p)) || null;
-  }
-  const dir = grokSessionDir(peerSessionId, cwd || process.cwd()) || grokSessionDir(peerSessionId);
-  return dir ? path.join(dir, 'updates.jsonl') : null;
-}
-
-function whichBin(name) {
-  try {
-    const r = spawnSync('which', [name], { encoding: 'utf8' });
-    return r.status === 0 ? String(r.stdout || '').trim() : null;
-  } catch { return null; }
-}
-
-function writeReplyFiles(leadSid, genId, { answer, meta, message, backend, peerSessionId, itemId }) {
-  const header = [
-    `# Co-agent reply`,
-    ``,
-    `**When:** ${new Date().toISOString()}`,
-    `**Generation:** ${genId}`,
-    `**Backend:** ${backend}`,
-    peerSessionId ? `**Session:** ${peerSessionId}` : '',
-    itemId ? `**Item:** ${itemId}` : '',
-    message ? `**Asked:** ${clip(message, 300)}` : '',
-    ``,
-    answer,
-    ``,
-    meta ? `---\n_${meta}_` : '',
-  ].filter(Boolean).join('\n');
-
-  S.atomicWrite(lastReplyPath(leadSid, genId), header);
-  S.writeJson(lastReplyMetaPath(leadSid, genId), {
-    at: new Date().toISOString(),
-    genId,
-    backend,
-    peerSessionId: peerSessionId || null,
-    itemId: itemId || null,
-    message: message || null,
-    answer,
-    answerPreview: clip(answer, 400),
-    meta: meta || null,
-  });
-  return { body: answer, wrapped: header };
-}
-
-function resolveContext(cli, { create = true } = {}) {
-  const defaultPersona = loadPersona(PERSONA_FILE);
-  const leadChoice = normalizeChoice(cli.lead ?? process.env.COAGENT_LEAD ?? defaultPersona.lead, 'lead');
-  const lead = resolveLead(leadChoice);
-  let genId = S.currentGeneration(STATE_DIR, lead.sessionId);
-  if (!genId && create) genId = S.ensureCurrent(STATE_DIR, lead.sessionId);
-  const meta = genId
-    ? S.loadMeta(STATE_DIR, lead.sessionId, genId)
-    : { sessionId: null, archivedAt: null, personaPath: null };
-
-  const personaPath = resolvePersonaPath(
-    cli.persona || process.env.COAGENT_PERSONA || meta.personaPath || null,
-  );
-  const persona = loadPersona(personaPath);
-  const leadModel = detectLeadModel(lead);
-  const callSpec = parseModelSpec(cli.modelSpec ?? process.env.COAGENT_MODEL ?? null);
-
-  let backendChoice = callSpec.backendChoice
-    || (persona.backend ? normalizeChoice(persona.backend, 'persona backend') : null)
-    || 'auto';
-  backendChoice = normalizeChoice(backendChoice, 'backend');
-  const backend = backendChoice === 'auto' ? lead.harness : backendChoice;
-
-  let model = null;
-  if (callSpec.raw != null) {
-    model = callSpec.modelId;
-  } else if (backend === lead.harness && leadModel.modelId) {
-    model = leadModel.modelId;
-  } else if (persona.model && backend === (persona.backend || backend)) {
-    model = persona.model;
-  }
-
-  let effort = persona.effort;
-  if (!cli.modelSpec && leadModel.effort && backend === lead.harness) {
-    effort = leadModel.effort;
-  }
-
-  if (lead.pin === 'cwd-mtime') {
-    console.error('coagent: warning: pinned by newest transcript in this tree — may be another window');
-  }
-
-  const leadCwd = (backend === lead.harness && leadModel.cwd) || process.cwd();
-  const agent = (backend === 'grok' && backend === lead.harness && leadModel.agent) || null;
-
-  return {
-    persona,
-    personaPath,
-    lead,
-    backend,
-    model,
-    effort,
-    genId,
-    meta,
-    leadModel,
-    leadCwd,
-    agent,
-    noGen: !genId,
-  };
-}
-
-async function reap(leadSid, genId) {
-  if (!genId) return;
-  // reapStale only reports an orphan whose pid still matches the process we
-  // spawned, so a recycled pid can't get an unrelated tree killed here.
-  const { orphanPid } = S.reapStale(STATE_DIR, leadSid, genId);
+async function reap(key) {
+  const { orphanPid } = S.reapStale(STATE_DIR, key);
   if (orphanPid) await killTree(orphanPid);
 }
 
-function buildPrompt({ dig, lead, backend, message, leadSid, genId }) {
-  const box = outboxDir(leadSid, genId);
-  const existing = listOutbox(leadSid, genId);
-  const existingNote = existing.length
-    ? [
-        `Existing outbox files:`,
-        ...existing.slice(0, 15).map((e) => `  - ${e.name} (${ageLabel(e.mtimeMs)}, ${e.size}B)`),
-      ].join('\n')
-    : 'Outbox is currently empty.';
-
-  const inline = (dig.inline || '').trim();
-  return [
-    `You are the lead agent's standing colleague (full capability, shared workspace).`,
-    `Generation: ${genId}.`,
-    ``,
-    `Live user ⇄ lead context (already inlined — do not skip):`,
-    inline || '_(no speech in the lead transcript yet)_',
-    ``,
-    `Full digest (only if you need more than the inline slice):`,
-    `  ${dig.digestPath}`,
-    dig.jsonPath ? `Structured snapshot JSON: ${dig.jsonPath}` : '',
-    `Raw lead transcript: ${lead.transcriptPath}`,
-    `Outbox: ${box}`,
-    existingNote,
-    `Write durable artifacts to the outbox. Reply: short summary + full path(s).`,
-    ``,
-    `Lead harness: ${lead.harness} (pin=${lead.pin || '?'}). Backend: ${backend}.`,
-    ``,
-    `The lead agent says:`,
-    message,
-  ].filter(Boolean).join('\n');
+async function killCurrentChild(key, itemId, { wait = true } = {}) {
+  const deadline = Date.now() + (wait ? 3000 : 0);
+  for (;;) {
+    const w = S.readWorker(STATE_DIR, key);
+    const mine = w && (!itemId || w.itemId === itemId);
+    if (mine && w.childPid && S.tokenAlive(w.childToken || w.childPid)) {
+      await killTree(w.childPid);
+      return true;
+    }
+    const item = itemId ? S.findItem(STATE_DIR, key, itemId) : null;
+    if (item && !S.isLive(item) && item.status !== 'interrupted') return false;
+    if (Date.now() >= deadline) return false;
+    await sleep(100);
+  }
 }
 
 async function runTurn(ctx, item) {
-  const { persona, lead, backend, model, effort, genId, leadCwd, agent } = ctx;
-  const mainSid = lead.sessionId;
-  let meta = S.loadMeta(STATE_DIR, mainSid, genId);
-
-  if (meta.sessionId && meta.backend && meta.backend !== backend) {
-    meta = { ...meta, sessionId: null, lastUuid: null };
-    S.saveMeta(STATE_DIR, mainSid, meta);
+  const { persona, ha, leadHa, lead, model, effort, leadCwd, agent, permissionMode, key } = ctx;
+  let meta = S.loadMeta(STATE_DIR, key);
+  const rules = buildRules({
+    personaBody: persona.persona,
+    personaPath: persona.path,
+    lead,
+    ha,
+    leadHa,
+  });
+  // A grok tape cannot be resumed as claude (or the reverse). Switching
+  // family starts a new inner session; the old tape stays on the roster.
+  const existing = !!meta.sessionId && (!meta.harness || meta.harness === ha.id);
+  if (meta.sessionId && meta.harness && meta.harness !== ha.id) {
+    console.error(`coagent: @${ctx.agentName} switching ${meta.harness} → ${ha.id}; new tape`);
   }
 
-  const existing = !!meta.sessionId;
-
-  const common = {
-    effort: effort || persona.effort,
-    model: model || null,
-    permissionMode: persona.permissionMode,
-    allowedTools: persona.allowedTools,
-    disallowedTools: persona.disallowedTools,
-    mcp: persona.mcp,
-    persona: persona.persona,
-    agent: agent || null,
-    cwd: leadCwd || process.cwd(),
-  };
-
-  const argsFor = ({ sid, resume, prompt }) => (backend === 'claude'
-    ? buildClaudeArgs({ ...common, prompt, sessionId: sid, resume })
-    : buildGrokArgs({ ...common, prompt, sessionId: sid, resume }));
-
-  const build = (marker) => {
-    const dig = buildDigest(lead, genId, marker);
-    return {
-      dig,
-      prompt: buildPrompt({ dig, lead, backend, message: item.message, leadSid: mainSid, genId }),
-    };
-  };
+  const argsFor = ({ sid, resume, prompt }) => ha.buildArgs({
+    prompt,
+    effort,
+    model,
+    permissionMode,
+    rules,
+    sessionId: sid,
+    resume,
+    agent,
+    cwd: leadCwd,
+  });
 
   const mkNew = (prompt) => {
     const sid = crypto.randomUUID();
     return { sid, args: argsFor({ sid, resume: false, prompt }) };
   };
 
-  let built = build(existing ? meta.lastUuid : null);
+  const prompt = item.message;
   let run = existing
-    ? { sid: meta.sessionId, args: argsFor({ sid: meta.sessionId, resume: true, prompt: built.prompt }) }
-    : mkNew(built.prompt);
+    ? { sid: meta.sessionId, args: argsFor({ sid: meta.sessionId, resume: true, prompt }) }
+    : mkNew(prompt);
 
   const stamp = (sid) => (childPid) => {
-    S.writeWorker(STATE_DIR, mainSid, genId, {
+    S.writeWorker(STATE_DIR, key, {
       pid: process.pid,
       childPid,
       childToken: S.pidToken(childPid),
       itemId: item.id,
       sessionId: sid,
     });
-    // An interrupt that lands before the child exists has nothing to kill;
-    // catch it here rather than letting the turn run to completion unread.
-    const now = S.findItem(STATE_DIR, mainSid, genId, item.id);
+    const now = S.findItem(STATE_DIR, key, item.id);
     if (now && now.status === 'interrupted') killTree(childPid).catch(() => { /* */ });
   };
 
-  const cmd = backend === 'claude' ? 'claude' : 'grok';
-  const runOpts = (sid) => ({
-    onSpawn: stamp(sid),
-    cwd: leadCwd || process.cwd(),
-    backend,
-    sessionId: sid,
-  });
-  // The waiter can abandon an item under us (interrupt, or a --timeout that
-  // SIGTERMs the child). Its non-zero exit is ours, not the backend's — don't
-  // read it as a failed resume and fork the tape.
   const abandoned = () => {
-    const now = S.findItem(STATE_DIR, mainSid, genId, item.id);
+    const now = S.findItem(STATE_DIR, key, item.id);
     return !!now && !S.isLive(now);
   };
 
-  let res = await runCmd(cmd, run.args, runOpts(run.sid));
+  const bin = H.resolveBin(ha);
+  const ping = { pingFile: pingsPath(lead.sessionId), pingFrom: ctx.agentName };
+  let res = await runCmd(bin, run.args, { onSpawn: stamp(run.sid), cwd: leadCwd, sessionId: run.sid, ha, ping });
   if (abandoned()) return { interrupted: true };
 
   let forkedFrom = null;
   if (res.code !== 0 && existing) {
-    // A fresh tape has seen nothing, so it needs the full digest — handing it
-    // the delta we built for the resumed thread would leave it working blind.
-    const full = build(null);
-    const fresh = mkNew(full.prompt);
+    const fresh = mkNew(prompt);
     console.error(`coagent: resume of ${meta.sessionId} failed (exit ${res.code}); starting a new tape ${fresh.sid}`);
-    const retry = await runCmd(cmd, fresh.args, runOpts(fresh.sid));
+    const retry = await runCmd(bin, fresh.args, { onSpawn: stamp(fresh.sid), cwd: leadCwd, sessionId: fresh.sid, ha, ping });
     if (abandoned()) return { interrupted: true };
     if (retry.code === 0) {
       run = fresh;
       res = retry;
-      built = full;
       forkedFrom = meta.sessionId;
     }
   }
@@ -990,47 +918,62 @@ async function runTurn(ctx, item) {
     return { failed: true, error: err, code: res.code };
   }
 
-  const parsed = parsePeerResult(backend, res.out);
+  const parsed = parseResult(res.out);
   if (parsed.sessionId) run.sid = parsed.sessionId;
 
-  const status = parsed.subtype
-    ? (parsed.isError ? `⚠ ${parsed.subtype}` : parsed.subtype)
-    : (parsed.isError ? '⚠ error' : null);
   const dur = parsed.durMs != null ? `${(parsed.durMs / 1000).toFixed(1)}s` : null;
-  const tpath = findPeerTranscript(backend, run.sid, leadCwd);
+  const cost = parsed.costUsd != null ? `$${Number(parsed.costUsd).toFixed(4)}` : null;
+  const turns = parsed.numTurns != null ? `${parsed.numTurns} turns` : null;
+  const inner = ha.sessionPaths(run.sid, leadCwd);
   const bits = [
-    `lead=${lead.harness}`,
-    `model=${model || backend}`,
-    `gen=${genId}`,
+    `lead=${lead.sessionId}`,
+    `model=${model || ha.id}`,
     `item=${item.id}`,
-    status,
+    parsed.isError && '⚠ error',
     parsed.stopReason,
     dur,
-    forkedFrom && `NEW TAPE (forked from ${forkedFrom} — colleague lost its memory)`,
-    built.dig.hardFallback && `fallback:${built.dig.fallbackNote}`,
-    tpath && `transcript: ${tpath}`,
+    turns,
+    cost,
+    forkedFrom && `NEW TAPE (forked from ${forkedFrom})`,
+    inner.transcript && `transcript: ${inner.transcript}`,
   ].filter(Boolean).join(' · ');
 
-  writeReplyFiles(mainSid, genId, {
+  writeReplyFiles(key, {
     answer: parsed.answer,
     meta: bits,
     message: item.message,
-    backend,
-    peerSessionId: run.sid,
+    sessionId: run.sid,
     itemId: item.id,
   });
 
-  S.saveMeta(STATE_DIR, mainSid, {
-    ...S.loadMeta(STATE_DIR, mainSid, genId),
+  S.addToRoster(STATE_DIR, key, {
+    id: run.sid,
+    createdAt: new Date().toISOString(),
+    cwd: leadCwd,
+    model,
+    harness: ha.id,
+  });
+  const prevMeta = S.loadMeta(STATE_DIR, key);
+  S.saveMeta(STATE_DIR, key, {
+    ...prevMeta,
     sessionId: run.sid,
-    forkedFrom: forkedFrom || null,
-    lastUuid: built.dig.lastMarker || meta.lastUuid || null,
-    backend,
+    harness: ha.id,
+    cwd: leadCwd,
     model: model || null,
+    effort: effort || null,
+    agent: agent || null,
     lastQuestion: item.message,
     lastQuestionAt: new Date().toISOString(),
     lastError: null,
     lastMeta: bits,
+    lastDurMs: parsed.durMs != null ? parsed.durMs : null,
+    lastCostUsd: parsed.costUsd != null ? parsed.costUsd : null,
+    lastNumTurns: parsed.numTurns != null ? parsed.numTurns : null,
+    // Running totals: the per-turn figure answers "what did that cost", the
+    // total answers "what has this colleague cost me", which is the one that
+    // actually changes how you brief the next one.
+    totalCostUsd: Number(prevMeta.totalCostUsd || 0) + Number(parsed.costUsd || 0),
+    totalTurns: Number(prevMeta.totalTurns || 0) + Number(parsed.numTurns || 0),
     personaPath: persona.path,
   });
 
@@ -1038,42 +981,39 @@ async function runTurn(ctx, item) {
 }
 
 async function processQueue(ctx) {
-  const { lead, genId } = ctx;
-  const mainSid = lead.sessionId;
-  await reap(mainSid, genId);
+  const key = ctx.key;
+  await reap(key);
   for (;;) {
-    const next = S.nextQueued(STATE_DIR, mainSid, genId);
+    const next = S.nextQueued(STATE_DIR, key);
     if (!next) return;
-    S.updateItem(STATE_DIR, mainSid, genId, next.id, {
+    S.updateItem(STATE_DIR, key, next.id, {
       status: 'running',
       startedAt: new Date().toISOString(),
     });
-    S.writeWorker(STATE_DIR, mainSid, genId, {
+    S.writeWorker(STATE_DIR, key, {
       pid: process.pid,
       childPid: null,
       itemId: next.id,
     });
     const result = await runTurn(ctx, next);
-    const now = S.findItem(STATE_DIR, mainSid, genId, next.id);
+    const now = S.findItem(STATE_DIR, key, next.id);
     if (now && now.status === 'interrupted') continue;
     if (result.interrupted) continue;
     if (result.failed) {
-      S.updateItem(STATE_DIR, mainSid, genId, next.id, {
+      S.updateItem(STATE_DIR, key, next.id, {
         status: 'failed',
         finishedAt: new Date().toISOString(),
         error: result.error,
       });
-      S.saveMeta(STATE_DIR, mainSid, {
-        ...S.loadMeta(STATE_DIR, mainSid, genId),
+      S.saveMeta(STATE_DIR, key, {
+        ...S.loadMeta(STATE_DIR, key),
         lastError: result.error,
       });
-      const leftover = S.loadInbox(STATE_DIR, mainSid, genId).filter((i) => i.status === 'queued').length;
-      if (leftover) {
-        console.error(`coagent: item ${next.id} failed; continuing queue (${leftover} remaining)`);
-      }
+      const leftover = S.loadInbox(STATE_DIR, key).filter((i) => i.status === 'queued').length;
+      if (leftover) console.error(`coagent: item ${next.id} failed; continuing queue (${leftover} remaining)`);
       continue;
     }
-    S.updateItem(STATE_DIR, mainSid, genId, next.id, {
+    S.updateItem(STATE_DIR, key, next.id, {
       status: 'done',
       finishedAt: new Date().toISOString(),
       error: null,
@@ -1084,510 +1024,530 @@ async function processQueue(ctx) {
 }
 
 async function becomeWorkerAndDrain(ctx) {
-  const { lead, genId } = ctx;
-  const mainSid = lead.sessionId;
-  if (!S.tryLock(STATE_DIR, mainSid, genId, process.pid)) return false;
+  const key = ctx.key;
+  if (!S.tryLock(STATE_DIR, key, process.pid)) return false;
+  S.writeWorker(STATE_DIR, key, { pid: process.pid, childPid: null, itemId: null });
   try {
     await processQueue(ctx);
   } finally {
-    S.releaseLock(STATE_DIR, mainSid, genId, process.pid);
-    const w = S.readWorker(STATE_DIR, mainSid, genId);
+    S.releaseLock(STATE_DIR, key, process.pid);
+    const w = S.readWorker(STATE_DIR, key);
     if (w && w.pid === process.pid) {
-      S.writeWorker(STATE_DIR, mainSid, genId, { pid: null, childPid: null, itemId: null });
+      S.writeWorker(STATE_DIR, key, { pid: null, childPid: null, itemId: null });
     }
   }
   return true;
 }
 
-/**
- * Runs the queue in the background of the waiter's poll loop. The drain must
- * never be awaited inline — doing so let a first send (which becomes its own
- * worker) run unbounded and made --timeout a no-op in the common case.
- */
-function makeDrainer(ctx) {
-  let active = null;
-  return {
-    start() {
-      if (active || !ctx) return;
-      active = becomeWorkerAndDrain(ctx)
-        .catch((e) => console.error(`coagent: worker error: ${e && e.message ? e.message : e}`))
-        .finally(() => { active = null; });
-    },
-    /** Finish any items we picked up but were not ourselves waiting on. */
-    async settle() {
-      while (active) await active;
-    },
+function workerEnv(ctx) {
+  const env = { ...process.env };
+  env.COAGENT_BG_WORKER = '1';
+  env.COAGENT_LEAD_SESSION_ID = ctx.lead.sessionId;
+  // Lead family for detect(); inner model/effort come from COAGENT_MODEL / COAGENT_EFFORT.
+  env.COAGENT_HARNESS = (ctx.leadHa || ctx.ha).id;
+  env.COAGENT_AGENT = ctx.agentName;
+  if (ctx.model) env.COAGENT_MODEL = ctx.model;
+  if (ctx.effort) env.COAGENT_EFFORT = ctx.effort;
+  if (ctx.lead.transcriptPath) env.COAGENT_LEAD_TRANSCRIPT = ctx.lead.transcriptPath;
+  env.COAGENT_HOME = ROOT;
+  return env;
+}
+
+function spawnDetachedWorker(ctx) {
+  const child = spawn(process.execPath, [__filename, '--worker'], {
+    detached: true,
+    stdio: 'ignore',
+    cwd: ctx.leadCwd || process.cwd(),
+    env: workerEnv(ctx),
+  });
+  child.unref();
+}
+
+async function ensureWorker(ctx) {
+  const key = ctx.key;
+  await reap(key);
+  if (S.workerAlive(STATE_DIR, key)) return;
+  spawnDetachedWorker(ctx);
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    if (S.workerAlive(STATE_DIR, key)) return;
+    await sleep(50);
+  }
+  console.error('coagent: warning: worker not yet running — try coagent');
+}
+
+function clip(s, n) { return R.clip(s, n, HOME); }
+
+async function cmdSend(message, cli, { later = false } = {}) {
+  if (!String(message || '').trim()) fail('usage: coagent "…"  or  coagent later "…"');
+  const ctx = resolveContext(cli);
+  const key = ctx.key;
+  await reap(key);
+
+  const running = S.runningItem(STATE_DIR, key);
+  let interrupted = null;
+  if (running && !later) {
+    interrupted = S.interruptRunning(STATE_DIR, key);
+    const item = S.enqueue(STATE_DIR, key, message, { front: true });
+    await killCurrentChild(key, running.id);
+    await ensureWorker(ctx);
+    console.log(`co-agent: send-now  ${item.id}  (interrupted ${running.id})`);
+    printSendFooter(ctx, item);
+    return;
+  }
+
+  const item = S.enqueue(STATE_DIR, key, message, { front: false });
+  await ensureWorker(ctx);
+  const kind = running && later ? 'queued' : 'sent';
+  const note = running && later ? `(behind ${running.id})` : '(starting)';
+  console.log(`co-agent: ${kind}  ${item.id}  ${note}`);
+  printSendFooter(ctx, item);
+  void interrupted;
+}
+
+function printSendFooter(ctx, item) {
+  // ctx.key, not the lead id: a named colleague has its own meta and its own
+  // inbox, so the lead's key reports the wrong session and the printed `wait`
+  // looks the item up in @main, where it does not exist.
+  const meta = S.loadMeta(STATE_DIR, ctx.key);
+  const at = ctx.agentName === DEFAULT_AGENT ? '' : `@${ctx.agentName} `;
+  if (meta.sessionId) console.log(`  inner: ${meta.sessionId}`);
+  console.log(`  wait: coagent ${at}wait ${item.id}    watch: coagent ${at}watch`);
+}
+
+function consultAge(item) {
+  return ageLabel(item && (item.finishedAt || item.startedAt || item.createdAt));
+}
+
+function printConsult(item, { full = false } = {}) {
+  console.log(R.formatConsult(item, {
+    home: HOME,
+    age: consultAge(item),
+    answerMax: full ? null : 240,
+  }));
+}
+
+function makeUpdatePump(ctx) {
+  // ctx.key: each colleague has its own tape. Keyed on the lead, watch and
+  // wait tail @main's transcript no matter which colleague was addressed.
+  const initialMeta = S.loadMeta(STATE_DIR, ctx.key);
+  const initial = ctx.ha.sessionPaths(initialMeta.sessionId, ctx.leadCwd).transcript;
+  let seenPath = initial && fs.existsSync(initial) ? initial : null;
+  let offset = seenPath ? fs.statSync(seenPath).size : 0;
+  return function pump() {
+    const m = S.loadMeta(STATE_DIR, ctx.key);
+    const p = ctx.ha.sessionPaths(m.sessionId, ctx.leadCwd).transcript;
+    if (!p || !fs.existsSync(p)) return;
+    if (p !== seenPath) {
+      offset = 0;
+      seenPath = p;
+    }
+    const { lines, size } = eventsSince(p, offset, (rec) => ctx.ha.formatUpdate(rec, HOME));
+    for (const ln of lines) console.error(ln);
+    offset = size;
   };
 }
 
-async function waitForItem(leadSid, genId, itemId, timeoutSec, drainer) {
-  const timeoutMs = (timeoutSec != null ? timeoutSec : 600) * 1000;
-  const start = Date.now();
-
-  while (Date.now() - start < timeoutMs) {
-    await reap(leadSid, genId);
-    const item = S.findItem(STATE_DIR, leadSid, genId, itemId);
-    if (!item) fail(`item ${itemId} disappeared`);
-    if (item.status === 'done') return item;
-    if (item.status === 'failed') fail(`co-agent failed: ${item.error || 'unknown'}`);
-    if (item.status === 'interrupted') fail(`item ${itemId} was interrupted`);
-    if (S.isLive(item) && !S.workerAlive(STATE_DIR, leadSid, genId)) drainer.start();
-    await sleep(250);
-  }
-
-  // Settle the item first so the worker sees it was abandoned and doesn't read
-  // our own SIGTERM as a failed resume. A non-waiting kill still checks for a
-  // live child before it looks at item state, so nothing is missed.
-  const w = S.readWorker(STATE_DIR, leadSid, genId);
-  if (w && w.pid === process.pid) {
-    S.updateItem(STATE_DIR, leadSid, genId, itemId, {
-      status: 'failed',
-      finishedAt: new Date().toISOString(),
-      error: `timed out after ${timeoutSec || 600}s`,
-    });
-    await killCurrentChild(leadSid, genId, itemId, { wait: false });
-  }
-  fail(`timed out after ${timeoutSec || 600}s waiting for item ${itemId}`);
-}
-
-/**
- * The worker stamps childPid only once the child spawns, so an interrupt can
- * arrive while it is still null. Wait briefly for the pid belonging to *this*
- * item rather than killing whatever the last stamp happened to leave behind.
- */
-async function killCurrentChild(leadSid, genId, itemId, { wait = true } = {}) {
-  const deadline = Date.now() + (wait ? 3000 : 0);
-  for (;;) {
-    const w = S.readWorker(STATE_DIR, leadSid, genId);
-    const mine = w && (!itemId || w.itemId === itemId);
-    if (mine && w.childPid && S.tokenAlive(w.childToken || w.childPid)) {
-      await killTree(w.childPid);
-      return true;
-    }
-    const item = itemId ? S.findItem(STATE_DIR, leadSid, genId, itemId) : null;
-    if (item && !S.isLive(item) && item.status !== 'interrupted') return false;
-    if (Date.now() >= deadline) return false;
-    await sleep(100);
-  }
-}
-
-async function cmdSend(message, cli) {
-  if (!String(message || '').trim()) fail('usage: coagent "<message>"');
+async function cmdStop(cli) {
   const ctx = resolveContext(cli);
-  const { lead, genId } = ctx;
-  const mainSid = lead.sessionId;
-  await reap(mainSid, genId);
-
-  if (cli.interrupt) {
-    const stopped = S.interruptRunning(STATE_DIR, mainSid, genId, { clearQueue: cli.clearQueue });
-    const running = stopped.find((it) => !it.error);
-    await killCurrentChild(mainSid, genId, running && running.id);
-  }
-
-  const item = S.enqueue(STATE_DIR, mainSid, genId, message, { front: !!cli.interrupt });
-  // The drain runs alongside the poll loop so --timeout can actually bound us.
-  const drainer = makeDrainer(ctx);
-  const done = await waitForItem(mainSid, genId, item.id, cli.timeoutSec, drainer);
-  const answer = done.answer || '';
-  if (cli.raw) {
-    process.stdout.write(answer + (answer.endsWith('\n') ? '' : '\n'));
-    await drainer.settle();
+  const key = ctx.key;
+  await reap(key);
+  const running = S.runningItem(STATE_DIR, key);
+  if (!running && !S.workerAlive(STATE_DIR, key)) {
+    console.log('co-agent: already idle');
     return;
   }
-  const latestMeta = S.readJson(lastReplyMetaPath(mainSid, genId), {});
-  if (latestMeta.itemId === done.id && fs.existsSync(lastReplyPath(mainSid, genId))) {
-    const body = fs.readFileSync(lastReplyPath(mainSid, genId), 'utf8');
-    process.stdout.write(body.endsWith('\n') ? body : `${body}\n`);
-  } else {
-    console.log(answer || '(done)');
-  }
-  if (done.meta) console.log(`\n↳ ${done.meta}`);
-  console.log(`↳ reply: ${lastReplyPath(mainSid, genId)}`);
-  // Our answer is out, but we may still be the worker for someone else's
-  // queued item — exiting now would orphan their child mid-turn.
-  await drainer.settle();
+  const stopped = S.interruptRunning(STATE_DIR, key);
+  await killCurrentChild(key, running && running.id);
+  const queued = S.loadInbox(STATE_DIR, key).filter((i) => i.status === 'queued').length;
+  console.log(`co-agent: stopped${stopped[0] ? ` ${stopped[0].id}` : ''}${queued ? `  (${queued} still queued)` : ''}`);
 }
 
-async function cmdStatus(cli) {
+function itemSettled(it) {
+  return it && (it.status === 'done' || it.status === 'failed' || it.status === 'interrupted');
+}
+
+async function cmdWait(cli, itemId) {
   const ctx = resolveContext(cli, { create: false });
-  const { lead, backend, model, effort, genId, meta, leadModel } = ctx;
-  if (ctx.noGen) {
-    console.log(`co-agent: lead=${lead.harness} (${lead.sessionId}) · pin=${lead.pin || '?'}`);
-    console.log('  generation: (none — send a message to start one)');
+  const key = ctx.key;
+  const timeoutSec = cli.timeoutSec != null ? cli.timeoutSec : DEFAULT_WAIT_SEC;
+  const deadline = Date.now() + timeoutSec * 1000;
+  await reap(key);
+
+  if (itemId) {
+    const target = S.findItem(STATE_DIR, key, itemId);
+    if (!target) fail(`unknown item ${itemId}`);
+  }
+
+  const trackedIds = itemId
+    ? [itemId]
+    : S.liveItems(STATE_DIR, key).map((i) => i.id);
+
+  const done = () => {
+    if (itemId) {
+      const it = S.findItem(STATE_DIR, key, itemId);
+      return itemSettled(it);
+    }
+    return !S.busy(STATE_DIR, key);
+  };
+
+  if (!done()) {
+    const pump = makeUpdatePump(ctx);
+    while (Date.now() < deadline) {
+      await reap(key);
+      pump();
+      if (done()) break;
+      await sleep(250);
+    }
+    pump();
+  }
+
+  if (!done()) fail(`timed out after ${timeoutSec}s waiting${itemId ? ` for ${itemId}` : ' for idle'}`);
+
+  let toPrint;
+  if (itemId) {
+    toPrint = [S.findItem(STATE_DIR, key, itemId)].filter(Boolean);
+  } else if (trackedIds.length) {
+    const byId = new Map(S.loadInbox(STATE_DIR, key).map((i) => [i.id, i]));
+    toPrint = trackedIds.map((id) => byId.get(id)).filter(itemSettled);
+    const extra = S.loadInbox(STATE_DIR, key).filter((i) => (
+      itemSettled(i) && !trackedIds.includes(i.id) && i.finishedAt
+      && Date.parse(i.finishedAt) >= deadline - timeoutSec * 1000
+    ));
+    for (const it of extra) {
+      if (!toPrint.some((x) => x.id === it.id)) toPrint.push(it);
+    }
+  } else {
+    const last = S.sortInboxNewestFirst(S.loadInbox(STATE_DIR, key)).find(itemSettled);
+    toPrint = last ? [last] : [];
+  }
+
+  if (!toPrint.length) {
+    console.log('co-agent: idle');
     return;
   }
-  await reap(lead.sessionId, genId);
-  const inbox = S.loadInbox(STATE_DIR, lead.sessionId, genId);
-  const live = inbox.filter((i) => i.status === 'queued' || i.status === 'running');
-  const w = S.readWorker(STATE_DIR, lead.sessionId, genId);
-  const workerOn = S.workerAlive(STATE_DIR, lead.sessionId, genId);
+  for (const it of toPrint) printConsult(it, { full: true });
+  const failed = toPrint.find((i) => i.status === 'failed');
+  if (failed) fail(`turn failed: ${failed.error || failed.id}`);
+}
 
-  console.log(`co-agent: lead=${lead.harness} (${lead.sessionId}) · pin=${lead.pin || '?'}`);
-  console.log(`  generation: ${genId}${meta.archivedAt ? ' (archived?)' : ''}`);
-  console.log(`  model: ${model || '(default)'}  backend=${backend}  effort=${effort || '?'}`);
-  if (leadModel.modelId) console.log(`  lead model: ${leadModel.modelId}${leadModel.effort ? ` · effort=${leadModel.effort}` : ''}`);
-  console.log(`  thread: ${meta.sessionId || '(none)'}`);
+function cmdStatus(cli) {
+  const ctx = resolveContext(cli, { create: false });
+  const key = ctx.key;
+  S.reapStale(STATE_DIR, key);
+  const meta = S.loadMeta(STATE_DIR, key);
+  const inbox = S.loadInbox(STATE_DIR, key);
+  const live = inbox.filter(S.isLive);
+  const w = S.readWorker(STATE_DIR, key);
+  const workerOn = S.workerAlive(STATE_DIR, key);
+  const inner = ctx.ha.sessionPaths(meta.sessionId, ctx.leadCwd);
+  const innerInfo = ctx.ha.describeSession(inner);
+
+  const family = ctx.leadHa && ctx.leadHa.id !== ctx.ha.id
+    ? `  inner=${ctx.ha.id}`
+    : '';
+  console.log(`co-agent: @${ctx.agentName}  lead=${ctx.lead.sessionId}  harness=${(ctx.leadHa || ctx.ha).id}${family}  pin=${ctx.lead.pin || '?'}`);
+  console.log(`  inner: ${meta.sessionId || '(none — send a message to start one)'}${innerInfo.title ? `  "${innerInfo.title}"` : ''}`);
+  console.log(`  model: ${ctx.model || '(default)'}  effort=${ctx.effort || '?'}`);
   console.log(`  worker: ${workerOn ? `pid=${w && w.pid}` : 'idle'}${w && w.childPid ? ` child=${w.childPid}` : ''}`);
   if (live.length) {
     console.log('  queue:');
-    for (const i of live) {
-      console.log(`    ${i.id}  ${i.status}  ${clip(i.message, 80)}`);
-    }
+    for (const i of live) console.log(`    ${i.id}  ${i.status}  ${clip(i.message, 80)}`);
   } else {
     console.log('  queue: empty');
   }
-  if (meta.lastQuestion) {
-    console.log(`  last ask (${ageLabel(meta.lastQuestionAt) || '?'}): ${clip(meta.lastQuestion, 160)}`);
+  const recent = S.sortInboxNewestFirst(inbox).filter(itemSettled).slice(0, 5);
+  if (recent.length) {
+    console.log('  recent:');
+    for (const i of recent) {
+      for (const ln of R.formatConsult(i, { home: HOME, age: consultAge(i), answerMax: 160 }).split('\n')) {
+        console.log(`    ${ln}`);
+      }
+    }
   }
   if (meta.lastError) console.log(`  last error: ${clip(meta.lastError, 200)}`);
-  if (meta.lastMeta) console.log(`  last meta: ${meta.lastMeta}`);
-  console.log(`  lead transcript: ${lead.transcriptPath}`);
-  if (meta.sessionId) {
-    const tp = findPeerTranscript(meta.backend || backend, meta.sessionId, ctx.leadCwd);
-    if (tp) console.log(`  coagent transcript: ${tp}`);
+  console.log(`  lead transcript: ${ctx.lead.transcriptPath || '(none)'}`);
+  if (ctx.lead.contextPath) console.log(`  lead context: ${ctx.lead.contextPath}`);
+  if (inner.transcript) console.log(`  inner transcript: ${inner.transcript}`);
+}
+
+function agentSummary(leadSessionId, name) {
+  const key = agentKey(leadSessionId, name);
+  S.reapStale(STATE_DIR, key);
+  const meta = S.loadMeta(STATE_DIR, key);
+  const inbox = S.loadInbox(STATE_DIR, key);
+  const live = inbox.filter(S.isLive);
+  const running = live.find((i) => i.status === 'running');
+  const state = running ? 'working' : (live.length ? `${live.length} queued` : 'idle');
+  const last = S.sortInboxNewestFirst(inbox).find(itemSettled);
+  return { name, key, meta, live, running, state, last };
+}
+
+function cmdAgents(cli) {
+  const ctx = resolveContext(cli, { create: false });
+  const names = listAgentNames(ctx.lead.sessionId);
+  if (!names.length) {
+    console.log('no colleagues yet — send a message to start one');
+    return;
   }
-  if (fs.existsSync(lastReplyPath(lead.sessionId, genId))) {
-    console.log(`  last reply: ${lastReplyPath(lead.sessionId, genId)} (${ageLabel(fs.statSync(lastReplyPath(lead.sessionId, genId)).mtimeMs)})`);
+  let inFlight = 0;
+  let fleetCost = 0;
+  for (const name of names) {
+    const a = agentSummary(ctx.lead.sessionId, name);
+    if (a.running || a.live.length) inFlight += 1;
+    fleetCost += Number(a.meta.totalCostUsd || 0);
+    const mark = name === ctx.agentName ? '*' : ' ';
+    const spend = a.meta.totalCostUsd ? `$${Number(a.meta.totalCostUsd).toFixed(3)}` : null;
+    const facts = [
+      a.state,
+      a.meta.harness && ctx.leadHa && a.meta.harness !== ctx.leadHa.id ? a.meta.harness : null,
+      a.meta.model,
+      a.meta.effort && a.meta.effort !== 'high' ? a.meta.effort : null,
+      a.running ? elapsedLabel(a.running.startedAt) : null,
+      spend,
+    ].filter(Boolean).join('  ');
+    console.log(`${mark} @${name}  ${facts}`);
+    const showing = a.running || a.live[0] || a.last;
+    if (showing) console.log(`    ${clip(showing.message, 90)}`);
   }
-  const box = listOutbox(lead.sessionId, genId);
-  console.log(`  outbox: ${outboxDir(lead.sessionId, genId, false)} (${box.length})`);
-  const gens = S.listGenIds(STATE_DIR, lead.sessionId);
-  if (gens.length > 1) console.log(`  generations: ${gens.length} (coagent sessions)`);
+  if (fleetCost) console.log(`  total: $${fleetCost.toFixed(3)}`);
+  // Claude Code has no wake-on-child-done. Grok does — do not nag a Grok
+  // lead to arm a follower they should not be running.
+  if (
+    inFlight
+    && ctx.leadHa
+    && ctx.leadHa.id === 'claude'
+    && !followerArmed(ctx.lead.sessionId)
+  ) {
+    console.log('');
+    console.log('  ⚠ no ping follower armed — notify/ask from these workers will not reach you.');
+    console.log('    arm it once per session:  coagent pings --follow');
+  }
+}
+
+async function cmdWaitAll(cli) {
+  const ctx = resolveContext(cli, { create: false });
+  const leadSessionId = ctx.lead.sessionId;
+  const timeoutSec = cli.timeoutSec != null ? cli.timeoutSec : DEFAULT_WAIT_SEC;
+  const deadline = Date.now() + timeoutSec * 1000;
+  const names = listAgentNames(leadSessionId);
+  if (!names.length) { console.log('co-agent: no colleagues'); return; }
+
+  const tracked = new Map();
+  for (const name of names) {
+    for (const it of S.liveItems(STATE_DIR, agentKey(leadSessionId, name))) tracked.set(it.id, name);
+  }
+  if (!tracked.size) { console.log('co-agent: all idle'); return; }
+
+  // Print each colleague's answer the moment it lands, not at the end.
+  const printed = new Set();
+  const drain = () => {
+    for (const [id, name] of tracked) {
+      if (printed.has(id)) continue;
+      const it = S.findItem(STATE_DIR, agentKey(leadSessionId, name), id);
+      if (!itemSettled(it)) continue;
+      printed.add(id);
+      console.log(`@${name}`);
+      printConsult(it, { full: true });
+    }
+    return printed.size === tracked.size;
+  };
+
+  while (Date.now() < deadline) {
+    for (const name of names) await reap(agentKey(leadSessionId, name));
+    if (drain()) break;
+    await sleep(300);
+  }
+  drain();
+  const pending = [...tracked].filter(([id]) => !printed.has(id));
+  if (pending.length) {
+    fail(`timed out after ${timeoutSec}s — still working: ${[...new Set(pending.map(([, n]) => `@${n}`))].join(', ')}`);
+  }
 }
 
 function cmdSessions(cli) {
   const ctx = resolveContext(cli, { create: false });
-  if (ctx.noGen && !S.listGenIds(STATE_DIR, ctx.lead.sessionId).length) {
-    console.log('no generations yet');
+  const key = ctx.key;
+  const meta = S.loadMeta(STATE_DIR, key);
+  const roster = S.loadRoster(STATE_DIR, key);
+  if (meta.sessionId && !roster.sessions.some((s) => s.id === meta.sessionId)) {
+    roster.sessions = [{ id: meta.sessionId, createdAt: meta.createdAt, cwd: meta.cwd, model: meta.model }, ...roster.sessions];
+  }
+  if (!roster.sessions.length) {
+    console.log('no inner sessions yet');
     return;
   }
-  const ids = S.listGenIds(STATE_DIR, ctx.lead.sessionId);
-  if (!ids.length) { console.log('no generations yet'); return; }
-  const cur = S.readCurrent(STATE_DIR, ctx.lead.sessionId);
-  for (const id of ids) {
-    const m = S.loadMeta(STATE_DIR, ctx.lead.sessionId, id);
-    const inbox = S.loadInbox(STATE_DIR, ctx.lead.sessionId, id);
-    const done = inbox.filter((i) => i.status === 'done').length;
-    const mark = id === cur ? '*' : ' ';
-    const state = m.archivedAt ? 'archived' : 'current';
+  for (const s of roster.sessions) {
+    const mark = s.id === meta.sessionId ? '*' : ' ';
+    const info = ctx.ha.describeSession(ctx.ha.sessionPaths(s.id, s.cwd || ctx.leadCwd));
     console.log(
-      `${mark} ${id}  ${state}` +
-      `${m.model ? `  ${m.backend || ''}/${m.model}` : (m.backend ? `  ${m.backend}` : '')}` +
-      `  ${done} consults` +
-      `${m.lastQuestionAt ? `  ${ageLabel(m.lastQuestionAt)}` : ''}` +
-      `${m.lastQuestion ? `  ${clip(m.lastQuestion, 50)}` : ''}`,
+      `${mark} ${s.id}` +
+      `${info.title ? `  ${info.title}` : ''}` +
+      `${s.model || info.modelId ? `  ${s.model || info.modelId}` : ''}` +
+      `${s.createdAt ? `  ${ageLabel(s.createdAt)}` : ''}`,
     );
   }
 }
 
-function cmdResume(cli, genId) {
-  if (!genId) fail('usage: coagent resume <generation-id>');
-  const ctx = resolveContext(cli, { create: false });
-  const meta = S.resumeGeneration(STATE_DIR, ctx.lead.sessionId, genId);
-  if (!meta) fail(`unknown generation: ${genId}`);
-  console.log(`co-agent: resumed ${genId}`);
-  console.log(`  thread: ${meta.sessionId || '(none — next message starts one)'}`);
+function cmdResume(cli, id) {
+  if (!id) fail('usage: coagent resume <session-id>');
+  const ctx = resolveContext(cli);
+  const key = ctx.key;
+  S.reapStale(STATE_DIR, key);
+  if (S.busy(STATE_DIR, key)) fail('busy — stop first, then resume');
+  const roster = S.loadRoster(STATE_DIR, key);
+  const meta = S.loadMeta(STATE_DIR, key);
+  const known = roster.sessions.some((s) => s.id === id) || meta.sessionId === id
+    || !!sessionPaths(id, ctx.leadCwd).transcript;
+  if (!known) fail(`unknown inner session: ${id}`);
+  S.addToRoster(STATE_DIR, key, { id, cwd: ctx.leadCwd, model: ctx.model, harness: ctx.ha.id });
+  S.clearInbox(STATE_DIR, key);
+  S.saveMeta(STATE_DIR, key, { ...meta, sessionId: id, lastError: null });
+  console.log(`co-agent: resumed ${id}`);
 }
 
 function cmdReset(cli) {
-  const ctx = resolveContext(cli, { create: false });
-  const old = S.readCurrent(STATE_DIR, ctx.lead.sessionId);
+  const ctx = resolveContext(cli);
+  const key = ctx.key;
+  S.reapStale(STATE_DIR, key);
+  if (S.busy(STATE_DIR, key)) fail('busy — stop first, then reset');
+  const meta = S.loadMeta(STATE_DIR, key);
+  const old = meta.sessionId;
+  if (old) S.addToRoster(STATE_DIR, key, { id: old, cwd: meta.cwd || ctx.leadCwd, model: meta.model, harness: meta.harness || ctx.ha.id });
+  S.clearInbox(STATE_DIR, key);
+  S.saveMeta(STATE_DIR, key, {
+    ...S.emptyMeta(),
+    harness: ctx.ha.id,
+    cwd: ctx.leadCwd,
+    model: ctx.model,
+    effort: ctx.effort,
+    agent: ctx.agent,
+  });
   if (!old) {
-    console.log('co-agent: no generation yet — nothing to archive');
+    console.log('co-agent: no inner session yet — next send starts one');
     return;
   }
-  const id = S.startGeneration(STATE_DIR, ctx.lead.sessionId);
-  console.log(`co-agent: archived ${old || '(none)'}, started ${id}`);
-  console.log('  old transcript kept. resume it with: coagent resume <id>');
+  for (const f of [pingsPath(ctx.lead.sessionId), pingsCursorPath(ctx.lead.sessionId), followerPath(ctx.lead.sessionId)]) {
+    try { fs.rmSync(f, { force: true }); } catch { /* */ }
+  }
+  try { fs.rmSync(asksDir(pingsPath(ctx.lead.sessionId)), { recursive: true, force: true }); } catch { /* */ }
+  console.log(`co-agent: reset  archived ${old}`);
+  console.log('  old tape kept. resume it with: coagent resume <id>');
 }
 
 function cmdLog(cli) {
   const ctx = resolveContext(cli, { create: false });
-  if (ctx.noGen) { console.log('no generation yet'); return; }
-  const inbox = S.sortInboxNewestFirst(S.loadInbox(STATE_DIR, ctx.lead.sessionId, ctx.genId));
-  if (!inbox.length) { console.log('no consults in this generation'); return; }
-  for (const i of inbox) {
-    console.log(
-      `${i.id}  ${i.status}` +
-      `${i.finishedAt ? `  ${ageLabel(i.finishedAt)}` : (i.createdAt ? `  ${ageLabel(i.createdAt)}` : '')}` +
-      `  ${clip(i.message, 80)}`,
-    );
-  }
+  const inbox = S.loadInbox(STATE_DIR, ctx.key);
+  if (!inbox.length) { console.log('no consults yet'); return; }
+  const items = [...inbox].sort((a, b) => (
+    String(a.startedAt || a.createdAt || '').localeCompare(String(b.startedAt || b.createdAt || ''))
+  ));
+  for (const i of items) printConsult(i, { full: true });
 }
 
-function cmdSearch(cli, query) {
-  if (!query) fail('usage: coagent search "<query>"');
+async function cmdWatch(cli) {
   const ctx = resolveContext(cli, { create: false });
-  if (ctx.noGen && !S.listGenIds(STATE_DIR, ctx.lead.sessionId).length) {
-    console.log('no matches');
-    return;
-  }
-  const hits = S.searchGens(STATE_DIR, ctx.lead.sessionId, query);
-  if (!hits.length) { console.log('no matches'); return; }
-  for (const h of hits.slice(0, 50)) {
-    const where = h.itemId ? `${h.label}:${h.itemId}` : h.label;
-    console.log(`${h.genId}${h.archived ? ' (archived)' : ''}  ${where}  ${h.text}`);
-  }
-  if (hits.length > 50) console.log(`… +${hits.length - 50} more`);
-}
-
-function cmdLead(cli) {
-  const ctx = resolveContext(cli, { create: false });
-  console.log(JSON.stringify({
-    lead: ctx.lead.harness,
-    leadSessionId: ctx.lead.sessionId,
-    leadTranscript: ctx.lead.transcriptPath,
-    pin: ctx.lead.pin || null,
-    genId: ctx.genId,
-    model: ctx.model || null,
-    leadModel: ctx.leadModel,
-    backend: ctx.backend,
-    grokSessionEnv: process.env.GROK_SESSION_ID || null,
-    agent: ctx.agent || null,
-    leadCwd: ctx.leadCwd || null,
-  }, null, 2));
-}
-
-function cmdDigest(cli) {
-  const ctx = resolveContext(cli, { create: false });
-  if (ctx.noGen) fail('no generation yet (send a message first)');
-  const dig = buildDigest(ctx.lead, ctx.genId, ctx.meta.lastUuid || null);
-  console.log(`lead=${ctx.lead.harness} backend=${ctx.backend} gen=${ctx.genId} pin=${ctx.lead.pin || '?'}`);
-  console.log(`digest: ${dig.digestPath}`);
-  console.log(`json: ${dig.jsonPath}`);
-  console.log(`lastMarker: ${dig.lastMarker}`);
-  console.log(`delta: ${dig.isDelta}${dig.fallbackNote ? ` · fallback: ${dig.fallbackNote}` : ''}`);
-  console.log(`thread: ${ctx.meta.sessionId || '(none)'}`);
-  const text = fs.readFileSync(dig.digestPath, 'utf8');
-  const lines = text.split('\n');
-  console.log('--- digest preview ---');
-  console.log(lines.slice(0, 50).join('\n'));
-  if (lines.length > 50) console.log(`… (${lines.length - 50} more lines, ${text.length} chars)`);
-}
-
-function cmdTranscript(cli) {
-  const ctx = resolveContext(cli, { create: false });
-  if (ctx.noGen) fail('no co-agent transcript yet (send a message first)');
-  const p = findPeerTranscript(ctx.meta.backend || ctx.backend, ctx.meta.sessionId, ctx.leadCwd);
-  if (!p) fail('no co-agent transcript yet (send a message first)');
-  console.log(p);
-}
-
-function cmdOutbox(cli, args) {
-  const ctx = resolveContext(cli, { create: false });
-  if (ctx.noGen) fail('no generation yet (send a message first)');
-  const sub = (args[0] || 'list').toLowerCase();
-  const dir = outboxDir(ctx.lead.sessionId, ctx.genId);
-  if (sub === 'path' || sub === 'dir') { console.log(dir); return; }
-  if (sub === 'list' || sub === 'ls') {
-    console.log(`outbox (gen ${ctx.genId}): ${dir}`);
-    console.log(formatOutboxListing(listOutbox(ctx.lead.sessionId, ctx.genId)));
-    return;
-  }
-  if (sub === 'cat' || sub === 'show' || sub === 'read') {
-    const name = args[1];
-    if (!name) fail('usage: coagent outbox cat <file>');
-    const p = path.join(dir, path.basename(name));
-    if (!fs.existsSync(p)) fail(`no outbox file: ${path.basename(name)}`);
-    const body = fs.readFileSync(p, 'utf8');
-    process.stdout.write(body);
-    if (!body.endsWith('\n')) console.log('');
-    return;
-  }
-  const p = path.join(dir, path.basename(sub));
-  if (fs.existsSync(p) && fs.statSync(p).isFile()) {
-    process.stdout.write(fs.readFileSync(p, 'utf8'));
-    return;
-  }
-  fail(`unknown outbox subcommand "${sub}" (list | path | cat <file>)`);
-}
-
-function cmdGc(cli) {
-  const ctx = resolveContext(cli, { create: false });
-  const leadSid = ctx.lead.sessionId;
-  let trimmed = 0;
-  for (const id of S.listGenIds(STATE_DIR, leadSid)) {
-    trimmed += S.trimInbox(STATE_DIR, leadSid, id);
-  }
-  const removed = S.gcEmptyGens(STATE_DIR, leadSid);
-  console.log(`co-agent: gc trimmed ${trimmed} inbox row(s), removed ${removed} empty generation(s)`);
-}
-
-function cmdDoctor(cli) {
-  const defaultPersona = loadPersona(PERSONA_FILE);
-  console.log('coagent doctor');
-  console.log(`  home: ${ROOT}`);
-  console.log(`  binary: ${__filename}`);
-  console.log(`  persona: ${PERSONA_FILE} (${fs.existsSync(PERSONA_FILE) ? 'ok' : 'MISSING'})`);
-  console.log(`  digest lib: ${path.join(ROOT, 'lib', 'digest.js')} (${fs.existsSync(path.join(ROOT, 'lib', 'digest.js')) ? 'ok' : 'MISSING'})`);
-  console.log(`  session lib: ${path.join(ROOT, 'lib', 'session.js')} (${fs.existsSync(path.join(ROOT, 'lib', 'session.js')) ? 'ok' : 'MISSING'})`);
-  console.log(`  claude cli: ${whichBin('claude') || 'NOT FOUND'}`);
-  console.log(`  grok cli: ${whichBin('grok') || 'NOT FOUND'}`);
-  console.log(`  env GROK_AGENT: ${process.env.GROK_AGENT || '(unset)'}`);
-  console.log(`  env GROK_SESSION_ID: ${process.env.GROK_SESSION_ID || '(unset)'}`);
-  try {
-    const ctx = resolveContext(cli || {}, { create: false });
-    console.log(`  lead: ${ctx.lead.harness} ${ctx.lead.sessionId}`);
-    console.log(`  pin: ${ctx.lead.pin}`);
-    console.log(`  lead model: ${ctx.leadModel.modelId || '(unknown)'}${ctx.leadModel.effort ? ` · ${ctx.leadModel.effort}` : ''}`);
-    console.log(`  using: ${ctx.backend} ${ctx.model || '(cli default)'} · effort=${ctx.effort}`);
-    console.log(`  agent: ${ctx.agent || '(default)'}  cwd: ${ctx.leadCwd || process.cwd()}`);
-    console.log(`  generation: ${ctx.genId || '(none)'}`);
-    console.log(`  thread: ${ctx.meta.sessionId || '(none)'}`);
-    console.log(`  queue: ${ctx.genId ? S.loadInbox(STATE_DIR, ctx.lead.sessionId, ctx.genId).filter((i) => i.status === 'queued' || i.status === 'running').length : 0}`);
-    console.log(`  generations: ${S.listGenIds(STATE_DIR, ctx.lead.sessionId).length}`);
-    console.log(`  persona effort (file): ${defaultPersona.effort}`);
-  } catch (e) {
-    console.log(`  lead resolve: FAIL — ${e.message || e}`);
-  }
-}
-
-async function cmdWatch(cli, intervalSec) {
-  const ctx = resolveContext(cli, { create: false });
-  if (ctx.noGen) {
-    console.log('co-agent: no thread/transcript yet');
-    return;
-  }
-  const { lead, backend, genId, meta } = ctx;
-  let b = meta.backend || backend;
-  let p = findPeerTranscript(b, meta.sessionId, ctx.leadCwd);
-  const interval = Math.max(0.2, intervalSec || 1) * 1000;
+  const key = ctx.key;
+  const meta = S.loadMeta(STATE_DIR, key);
   const follow = !!cli.follow;
-  const deadline = cli.timeoutSec != null && cli.timeoutSec > 0
-    ? Date.now() + cli.timeoutSec * 1000
-    : null;
+  let p = ctx.ha.sessionPaths(meta.sessionId, ctx.leadCwd).transcript;
+  console.error(`watching ${meta.sessionId || '(waiting)'} · ${p || '(no tape yet)'} · follow=${follow}`);
+  const pump = makeUpdatePump(ctx);
 
-  if (!p && !follow) {
-    console.log('co-agent: no thread/transcript yet');
-    return;
-  }
-
-  let offset = 0;
-  if (p && fs.existsSync(p)) offset = fs.statSync(p).size;
-  console.error(`watching gen ${genId} · ${p || '(waiting)'} · follow=${follow}`);
-
-  while (true) {
-    if (deadline && Date.now() > deadline) return;
-    const m = S.loadMeta(STATE_DIR, lead.sessionId, genId);
-    b = m.backend || backend;
-    p = findPeerTranscript(b, m.sessionId, ctx.leadCwd);
-    if (p && fs.existsSync(p)) {
-      const { lines, size } = peerEventsSince(b, p, offset);
-      for (const ln of lines) console.error(ln);
-      offset = size;
-    }
-    const busy = S.workerAlive(STATE_DIR, lead.sessionId, genId)
-      || S.loadInbox(STATE_DIR, lead.sessionId, genId).some((i) => i.status === 'running' || i.status === 'queued');
-    if (!follow && !busy) {
-      if (p && fs.existsSync(p)) {
-        const { lines, size } = peerEventsSince(b, p, offset);
-        for (const ln of lines) console.error(ln);
-        offset = size;
-      }
-      console.log(`_(idle · reply: ${lastReplyPath(lead.sessionId, genId)})_`);
+  for (;;) {
+    S.reapStale(STATE_DIR, key);
+    pump();
+    const stillBusy = S.busy(STATE_DIR, key);
+    if (!follow && !stillBusy) {
+      pump();
+      console.log('_(idle)_');
       return;
     }
-    await sleep(interval);
+    await sleep(400);
   }
 }
 
-function peerEventsSince(backend, transcriptPath, sinceByte) {
-  if (!transcriptPath || !fs.existsSync(transcriptPath)) return { lines: [], size: 0 };
-  const st = fs.statSync(transcriptPath);
-  const size = st.size;
-  if (sinceByte >= size) return { lines: [], size };
-  const fd = fs.openSync(transcriptPath, 'r');
-  try {
-    const len = size - sinceByte;
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, sinceByte);
-    let chunk = buf.toString('utf8');
-    if (sinceByte > 0 && !chunk.startsWith('\n') && chunk.includes('\n')) {
-      chunk = chunk.slice(chunk.indexOf('\n') + 1);
-    }
-    const lines = [];
-    for (const line of chunk.split('\n').filter(Boolean)) {
-      let rec; try { rec = JSON.parse(line); } catch { continue; }
-      if (backend === 'claude') {
-        if (rec.isSidechain) continue;
-        const c = rec.message && rec.message.content;
-        if (rec.type === 'assistant' && Array.isArray(c)) {
-          for (const part of c) {
-            if (part.type === 'text' && part.text) lines.push(`● ${clip(digestLib.stripNoise(part.text), 200)}`);
-            else if (part.type === 'tool_use') {
-              lines.push(`  ↳ ${part.name}${digestLib.summarizeToolInput(part.input, HOME)}`);
-            }
-          }
-        }
-      } else if (rec.method === 'session/update') {
-        const u = (rec.params && rec.params.update) || {};
-        const kind = u.sessionUpdate;
-        if (kind === 'agent_message_chunk') {
-          const t = digestLib.stripNoise(digestLib.textFromContent(u.content));
-          if (t) lines.push(`● ${clip(t, 200)}`);
-        } else if (kind === 'tool_call') {
-          const name = (u._meta && u._meta['x.ai/tool'] && u._meta['x.ai/tool'].name) || u.title || 'tool';
-          lines.push(`  ↳ ${name}${digestLib.summarizeToolInput(u.rawInput || {}, HOME)}`);
-        } else if (kind === 'tool_call_update' && (u.status === 'completed' || u.status === 'failed')) {
-          const t = digestLib.stripNoise(digestLib.textFromContent(u.content));
-          if (t) lines.push(`      → ${clip(t, 160)}`);
-        }
-      }
-    }
-    return { lines, size };
-  } finally {
-    fs.closeSync(fd);
+function cmdDoctor() {
+  console.log(`home:     ${ROOT}`);
+  console.log(`persona:  ${fs.existsSync(PERSONA_FILE) ? PERSONA_FILE : 'MISSING'}`);
+  console.log(`state:    ${STATE_DIR}`);
+  const r = H.resolve();
+  if (r.error) {
+    console.log(`harness:  (none) — ${r.error}`);
+    for (const a of H.ADAPTERS) console.log(`  ${a.id}: bin=${H.resolveBin(a)}  home=${a.home}`);
+    return;
   }
+  const { harness: ha, lead } = r;
+  console.log(`harness:  ${ha.id} (${ha.label})`);
+  console.log(`bin:      ${H.resolveBin(ha)}`);
+  for (const a of H.ADAPTERS) {
+    if (a.id === ha.id) continue;
+    console.log(`  also:    ${a.id} bin=${H.resolveBin(a)}`);
+  }
+  console.log(`lead:     ${lead.sessionId}  pin=${lead.pin}`);
+  console.log(`history:  ${lead.transcriptPath || '(none)'}`);
+  if (lead.contextPath) console.log(`context:  ${lead.contextPath}`);
 }
 
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (parsed.help) { printHelp(); return; }
   const cli = {
-    lead: parsed.lead,
-    modelSpec: parsed.modelSpec,
-    persona: parsed.persona,
+    model: parsed.model,
+    effort: parsed.effort,
     follow: parsed.follow,
-    raw: parsed.raw,
-    interrupt: parsed.interrupt,
-    clearQueue: parsed.clearQueue,
     timeoutSec: parsed.timeoutSec,
+    agentName: parsed.agentName,
+    all: parsed.all,
   };
+  const brief = parsed.briefFile ? readBrief(parsed.briefFile) : null;
+  // A brief replaces the message, so inline text alongside it is ambiguous
+  // about which one the worker should act on.
+  const sendText = (verbArgs) => {
+    const inline = verbArgs.join(' ').trim();
+    if (brief && inline) fail('pass the message inline or with --brief-file, not both');
+    return brief || inline;
+  };
+
+  if (parsed.worker || process.env.COAGENT_BG_WORKER === '1') {
+    const ctx = resolveContext(cli);
+    await becomeWorkerAndDrain(ctx);
+    return;
+  }
+
   const rest = parsed.rest;
   const verb = rest[0];
 
-  const verbs = new Set([
-    'status', 'reset', 'sessions', 'resume', 'log', 'search',
-    'lead', 'digest', 'transcript', 'doctor', 'outbox', 'watch', 'gc',
-    'ask', 'peers', 'rm', 'bg', 'join', 'jobs',
-  ]);
-
-  if (!verb) fail('usage: coagent [options] "<message>" | status | reset | …  (try --help)');
-
-  if (verb === 'ask' || verb === 'peers' || verb === 'rm' || verb === 'bg' || verb === 'join' || verb === 'jobs') {
-    fail('one standing co-agent now. Send: coagent "…". Fresh tape: coagent reset. Interrupt: coagent --interrupt "…"');
+  const WORKER_VERBS = new Set(['notify', 'ask', 'pings']);
+  if (process.env.COAGENT_PING_FILE && !WORKER_VERBS.has(verb)) {
+    fail(`you are a co-agent — only ${[...WORKER_VERBS].join(', ')} are available to you`);
   }
-  if (verb === 'status') return await cmdStatus(cli);
-  if (verb === 'sessions') return cmdSessions(cli);
-  if (verb === 'gc') return cmdGc(cli);
-  if (verb === 'resume') return cmdResume(cli, rest[1]);
-  if (verb === 'reset') return cmdReset(cli);
+
+  if (!verb) return brief ? await cmdSend(brief, cli, { later: false }) : cmdStatus(cli);
+
+  if (verb === 'notify') return cmdNotify(sendText(rest.slice(1)));
+  if (verb === 'ask') return await cmdAsk(cli, sendText(rest.slice(1)));
+  if (verb === 'answer') return cmdAnswer(rest[1], sendText(rest.slice(2)));
+  if (verb === 'asks') return cmdAsks(cli, rest[1]);
+  if (verb === 'pings') return await cmdPings(cli);
+  if (verb === 'help') { printHelp(); return; }
+  if (verb === 'status') return cmdStatus(cli);
+  if (verb === 'later') return await cmdSend(sendText(rest.slice(1)), cli, { later: true });
+  if (verb === 'now') return await cmdSend(sendText(rest.slice(1)), cli, { later: false });
+  if (verb === 'stop') return await cmdStop(cli);
+  if (verb === 'wait') return cli.all ? await cmdWaitAll(cli) : await cmdWait(cli, rest[1]);
+  if (verb === 'agents') return cmdAgents(cli);
+  if (verb === 'watch') return await cmdWatch(cli);
   if (verb === 'log') return cmdLog(cli);
-  if (verb === 'search') return cmdSearch(cli, rest.slice(1).join(' '));
-  if (verb === 'lead') return cmdLead(cli);
-  if (verb === 'digest') return cmdDigest(cli);
-  if (verb === 'transcript') return cmdTranscript(cli);
-  if (verb === 'doctor') return cmdDoctor(cli);
-  if (verb === 'outbox') return cmdOutbox(cli, rest.slice(1));
-  if (verb === 'watch') {
-    let interval;
-    for (const a of rest.slice(1)) {
-      if (!Number.isNaN(Number(a))) { interval = Number(a); break; }
-    }
-    return cmdWatch(cli, interval);
-  }
+  if (verb === 'reset') return cmdReset(cli);
+  if (verb === 'sessions') return cmdSessions(cli);
+  if (verb === 'resume') return cmdResume(cli, rest[1]);
+  if (verb === 'doctor') return cmdDoctor();
 
-  await cmdSend(rest.join(' '), cli);
+  if (VERBS.has(verb) === false && !verb.startsWith('-')) {
+    return await cmdSend(sendText(rest), cli, { later: false });
+  }
+  fail(`unknown command ${verb}  (try --help)`);
 }
 
 if (require.main === module) {
@@ -1595,11 +1555,10 @@ if (require.main === module) {
 }
 
 module.exports = {
-  buildDigest,
-  resolveLead,
-  parseModelSpec,
   parseArgs,
-  detectLeadModel,
-  digestLib,
-  session: S,
+  resolveEffort,
+  buildRules,
+  parseResult,
+  loadPersona,
+  DEFAULT_WAIT_SEC,
 };

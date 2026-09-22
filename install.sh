@@ -19,7 +19,7 @@ rsync -a --delete \
   --exclude 'node_modules/' \
   "$ROOT/lib/" "$HOME_DIR/lib/"
 
-rsync -a "$ROOT/test/" "$HOME_DIR/test/"
+rsync -a --delete "$ROOT/test/" "$HOME_DIR/test/"
 cp "$ROOT/README.md" "$HOME_DIR/README.md"
 cp "$ROOT/AGENTS.md" "$HOME_DIR/AGENTS.md"
 cp "$ROOT/package.json" "$HOME_DIR/package.json"

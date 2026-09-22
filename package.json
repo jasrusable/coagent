@@ -1,12 +1,12 @@
 {
   "name": "coagent",
-  "version": "1.0.0",
-  "description": "Harness-agnostic peer agents for Claude Code and Grok Build",
+  "version": "2.0.0",
+  "description": "The lead agent's inner agent (Grok or Claude Code)",
   "bin": {
     "coagent": "./bin/coagent"
   },
   "scripts": {
-    "test": "node test/digest.test.js && node test/session.test.js && node test/cli.test.js && node test/concurrency.test.js"
+    "test": "node test/session.test.js && node test/cli.test.js && node test/render.test.js && node test/harness.test.js && node test/concurrency.test.js"
   },
   "license": "MIT",
   "private": true
