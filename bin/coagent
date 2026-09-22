@@ -100,7 +100,7 @@ Colleagues (parallel):
   coagent agents                 who exists, doing what, elapsed and spend
   coagent pings                  new worker flags since you last read
   coagent pings --all            the whole ping log
-  coagent pings --follow         Claude leads: stream live (arm once). Grok leads: skip.
+  coagent pings --follow         stream new flags as they arrive
   coagent asks                   questions workers are blocked on (full text)
   coagent asks <id>              one question, answered or not
   coagent answer <id> "…"        unblock one
@@ -133,9 +133,6 @@ Options:
   Inner agents can be a different family: \`--model fable\` / \`opus\` /
   \`claude-*\` drives Claude; \`grok-*\` drives Grok. \`coagent doctor\`
   shows the lead. Switching family on a colleague starts a new tape.
-
-  Grok leads: use native background agents; do not arm pings --follow.
-  Claude leads: arm \`coagent pings --follow\` once per session.
 
   @main follows the lead's model and effort unless you pass --model /
   --effort. Named colleagues can default via persona frontmatter —
@@ -1311,8 +1308,7 @@ function cmdAgents(cli) {
     if (showing) console.log(`    ${clip(showing.message, 90)}`);
   }
   if (fleetCost) console.log(`  total: $${fleetCost.toFixed(3)}`);
-  // Claude Code has no wake-on-child-done. Grok does — do not nag a Grok
-  // lead to arm a follower they should not be running.
+  // Claude Code has no wake-on-child-done, so a silent ask looks hung.
   if (
     inFlight
     && ctx.leadHa

@@ -27,18 +27,6 @@ new tape.
 
 One colleague **per harness session**. Send is background. The inner session persists across messages. `reset` starts a new tape; old ones stay on disk.
 
-### Grok lead vs Claude lead
-
-A **Grok** lead should not arm `pings --follow` as a session ritual. Grok already
-wakes the lead when a background agent finishes — that is the notification
-path. Prefer Grok's native background agents for Grok-family work. Use
-`coagent --model fable` / `opus` only when you want the other family. Check
-results with `coagent @name log` (or wait); do not run both systems on one job.
-
-A **Claude Code** lead still needs `coagent pings --follow` once per session.
-That harness has no equivalent wake-on-child-done, so without a follower
-`notify` is invisible and `ask` parks like a hung worker.
-
 - **Checkout:** `~/projects/coagent`
 - **Home:** `~/.coagent/` (`state/` is not in git)
 - **Binary:** `~/.local/bin/coagent`
@@ -99,36 +87,6 @@ There is no digest — your message is the worker's only context. For anything l
 coagent @review --brief-file brief.md
 coagent @review - < brief.md          # same, from stdin
 ```
-
-### The ping channel
-
-Workers reach you mid-job over an append-only log shared by every colleague of one lead.
-
-```bash
-coagent pings --follow    # Claude leads: arm once. Grok leads: skip.
-coagent pings             # new flags since last read
-coagent pings --all       # whole log
-coagent asks              # questions workers are blocked on, in full
-coagent asks <id>         # one question, answered or not
-coagent answer <id> "…"   # unblock one
-```
-
-`--follow` is the delivery path **for a Claude Code lead**. Without it a
-`notify` waits for a manual pull and an `ask` parks unseen. `agents` warns
-when a Claude lead has in-flight work and nothing is following. A Grok lead
-does not get that warning — do not arm a follower there.
-
-Questions are printed **whole, never clipped**. A question read at 160 characters gets answered on a guess, and the guess is indistinguishable from an answer to the worker.
-
-### Inside a worker
-
-A worker's env is scrubbed of lead identity, so it gets only these three verbs — every other one is refused:
-
-| Verb | Use |
-|------|-----|
-| `coagent notify "…"` | Flag something that changes what should happen next. Never progress or narration. |
-| `coagent ask "…"` | Block on a question and print the answer. On `NO ANSWER YET` stop and end the turn; the tape is kept and resumed with the answer. |
-| `coagent pings` | What other workers have flagged. |
 
 ### Model policy
 

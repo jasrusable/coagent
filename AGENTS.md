@@ -31,7 +31,7 @@ This checkout is the source. Runtime home is `~/.coagent/` (`state/` is not in g
 - `@main` follows the lead unless `--model` / `--effort` is set. Named colleagues may default via persona `workerModel` / `workerEffort` / `model.<agent>` / `effort.<agent>`.
 - A brief may come from `--brief-file <path>` or stdin (`-`). Prefer it for long briefs: argv is shell-parsed and backticks would execute.
 - Questions (`asks`) print whole, never clipped — a clipped question gets answered on a guess. `asks <id>` shows one, answered or not.
-- Claude Code leads: `pings --follow` once per session; `agents` warns if in-flight work has no follower. Grok leads: do not arm a follower — use native background agents; coagent is for cross-family (`fable` / `opus`) and persistent tapes.
+- Claude Code leads: `pings --follow` once per session; `agents` warns if in-flight work has no follower.
 - Send returns immediately. Busy send interrupts. `later` queues. `stop` kills the running turn.
 - `wait` streams the inner tape, then prints consults that finished (`wait <id>` for one turn).
 - Inner system prompt every turn: identity + lead transcript paths + labeled `persona.md` (grok `--rules`, claude `--append-system-prompt`). Project AGENTS.md / CLAUDE.md come from the lead's cwd.
