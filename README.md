@@ -2,7 +2,7 @@
 
 The lead agent's inner agent. Same idea as the lead is an agent for the human: the co-agent is an agent for the lead.
 
-**Completely vibe-coded. No code review.** This grew by prompting and has not been reviewed. Read it before you point it at a repo you care about. The inner agent runs with `--always-approve`.
+**Completely vibe-coded. No code review.** This grew by prompting and has not been reviewed. Read it before you point it at a repo you care about. By default the inner agent runs with approvals bypassed. `--readonly` turns that off.
 
 ```
 You (human) → Lead (Grok or Claude Code) → inner agent (Grok, Claude, Opus, or Fable)
@@ -10,7 +10,7 @@ You (human) → Lead (Grok or Claude Code) → inner agent (Grok, Claude, Opus, 
 
 ## Why
 
-A lead that does every long job in its own session spends that session's context on the job, and it can only use its own model. Coagent is a colleague the lead keeps on the side, on the same checkout.
+A lead that does every long job in its own session spends that session's context on the job, and it can only use its own model. Coagent is a colleague the lead keeps on the side. It starts in the lead's checkout; `--cwd` points it at another one.
 
 - **You keep the lead.** Send returns immediately. The lead goes on talking, editing, and answering you while the colleague works. The next send steers a busy colleague; `later` queues behind the current turn.
 - **The colleague remembers.** Its tape lasts until `reset`. A second pass, or "look again now that this is fixed", continues that session.
@@ -52,7 +52,8 @@ coagent wait <id>              # stream until that turn; print it
 coagent                        # snapshot + recent consults
 coagent log                    # consults (your messages + inner replies)
 coagent watch                  # live tail of inner updates.jsonl
-coagent reset                  # new inner session
+coagent reset                  # new tape for @main; named colleagues keep theirs
+coagent @name reset            # new tape for that colleague
 coagent sessions               # list inner sessions for this lead
 coagent resume <id>            # make an old inner session current
 ```
@@ -61,13 +62,15 @@ Busy send is steer — it stops the current turn and runs the new message next. 
 
 Ctrl-C on `wait` / `watch` only stops waiting. Use `coagent stop` to stop the inner grok.
 
-It runs `--always-approve`. Don't walk away from destructive work. Reset between unrelated jobs so the tape doesn't rot.
+`wait` prints the consult when the turn finishes. That text is the result.
+
+By default it bypasses approvals. `--readonly` does not: the colleague can read, and writes are refused by the harness. It sticks until `--read-write`. `--cwd <dir>` is the colleague's directory and sticks the same way. A change of directory or access starts a new tape. Reset between unrelated jobs so the tape doesn't rot.
 
 `--model` / `--effort` override that turn. `--model` may pick the other family
 (`coagent @review --model fable --effort high "…"` from a Grok lead). The inner system prompt
 carries identity + lead transcript paths + `persona.md` every turn — as `--rules`
 on Grok, `--append-system-prompt` on Claude. Project `AGENTS.md` / `CLAUDE.md`
-files load from the lead's cwd.
+files load from the colleague's directory.
 
 ## Colleagues (parallel)
 

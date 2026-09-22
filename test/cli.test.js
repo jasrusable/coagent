@@ -2,7 +2,10 @@
 'use strict';
 
 const assert = require('assert');
-const { parseArgs, resolveEffort, buildRules, parseResult, loadPersona, DEFAULT_WAIT_SEC } = require('../bin/coagent');
+const {
+  parseArgs, resolveEffort, resolveWorkdir, resolveAccess, resumeDecision,
+  buildRules, parseResult, loadPersona, DEFAULT_WAIT_SEC,
+} = require('../bin/coagent');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -75,6 +78,30 @@ test('buildRules names identity, forbids recursion, points at the tapes, labels 
   assert.match(rules, /Be terse/);
 });
 
+test('buildRules tells a read-only colleague the harness refuses writes', () => {
+  const rules = buildRules({
+    personaBody: 'Be terse.',
+    personaPath: '/tmp/persona.md',
+    ha: grok,
+    leadHa: grok,
+    access: 'read-only',
+    lead: { sessionId: 'lead-1', transcriptPath: '/tmp/updates.jsonl', contextPath: null },
+  });
+  assert.match(rules, /Read-only/);
+  assert.match(rules, /refuses writes/);
+});
+
+test('grok runningCost reads usage.json ticks as dollars', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-cost-'));
+  fs.writeFileSync(path.join(dir, 'usage.json'), JSON.stringify({
+    session: { costUsdTicks: 126890500 },
+  }));
+  assert.equal(grok.runningCost({ dir }), 126890500 / 1e10);
+  assert.equal(grok.runningCost({ dir: path.join(dir, 'missing') }), null);
+  assert.equal(claude.runningCost({ dir }), null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('buildRules notes a cross-family inner agent', () => {
   const rules = buildRules({
     personaBody: 'Be terse.',
@@ -118,6 +145,12 @@ test('grok args resume vs create', () => {
   assert.ok(create.includes('--always-approve'));
   assert.ok(create.includes('--rules'));
   assert.ok(create.includes('--cwd'));
+  assert.ok(!create.includes('--sandbox'));
+  const locked = grok.buildArgs({ ...common, access: 'read-only', sessionId: 'sid', resume: false });
+  assert.ok(!locked.includes('--always-approve'));
+  assert.equal(locked[locked.indexOf('--permission-mode') + 1], 'dontAsk');
+  assert.equal(locked[locked.indexOf('--sandbox') + 1], 'read-only');
+  assert.ok(locked.includes('--cwd'));
   const resume = grok.buildArgs({ ...common, sessionId: 'sid', resume: true });
   assert.ok(resume.includes('--resume'));
   assert.ok(!resume.includes('--session-id'));
@@ -140,6 +173,15 @@ test('claude args map rules to --append-system-prompt and skip grok-only flags',
   for (const gone of ['--rules', '--verbatim', '--always-approve', '--cwd']) {
     assert.ok(!create.includes(gone), `${gone} should not be passed to claude`);
   }
+  const locked = claude.buildArgs({ ...common, access: 'read-only', sessionId: 'sid', resume: false });
+  assert.equal(locked[locked.indexOf('--permission-mode') + 1], 'dontAsk');
+  assert.ok(locked.includes('--permission-prompts'));
+  assert.equal(locked[locked.indexOf('--permission-prompts') + 1], 'none');
+  assert.ok(locked.includes('--strict-mcp-config'));
+  assert.match(locked[locked.indexOf('--disallowed-tools') + 1], /Edit/);
+  assert.match(locked[locked.indexOf('--disallowed-tools') + 1], /Write/);
+  assert.ok(!locked.includes('--always-approve'));
+  assert.ok(!locked.includes('bypassPermissions'));
   const resume = claude.buildArgs({ ...common, sessionId: 'sid', resume: true });
   assert.ok(resume.includes('--resume'));
   assert.ok(!resume.includes('--session-id'));
@@ -210,6 +252,62 @@ test('parseArgs reads a brief from a file or stdin', () => {
 test('parseArgs still rejects unknown options', () => {
   assert.throws(() => parseArgs(['--brief-file']), /needs a path/);
   assert.throws(() => parseArgs(['--nope']), /unknown option/);
+});
+
+test('parseArgs addresses @name before the verb or just after reset', () => {
+  const a = parseArgs(['@fable', 'reset']);
+  assert.equal(a.agentName, 'fable');
+  assert.deepEqual(a.rest, ['reset']);
+  const b = parseArgs(['reset', '@fable']);
+  assert.equal(b.agentName, 'fable');
+  assert.deepEqual(b.rest, ['reset']);
+  const c = parseArgs(['review', '@fable']);
+  assert.equal(c.agentName, null);
+  assert.deepEqual(c.rest, ['review', '@fable']);
+  assert.throws(() => parseArgs(['@_nope', 'reset']), /bad agent name/);
+});
+
+test('parseArgs reads --cwd and read-only', () => {
+  const a = parseArgs(['--cwd', '/tmp/wt', '--readonly', '@fable', 'look']);
+  assert.equal(a.cwd, '/tmp/wt');
+  assert.equal(a.access, 'read-only');
+  assert.equal(a.agentName, 'fable');
+  assert.equal(parseArgs(['--cwd=/tmp/wt']).cwd, '/tmp/wt');
+  assert.equal(parseArgs(['--read-only']).access, 'read-only');
+  assert.equal(parseArgs(['--read-write']).access, 'full');
+  assert.throws(() => parseArgs(['--cwd']), /directory/);
+  assert.throws(() => parseArgs(['--readonly', '--read-write']), /not both/);
+});
+
+test('resolveWorkdir requires a real directory and keeps the path given', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-wd-'));
+  assert.equal(resolveWorkdir(dir), fs.realpathSync(dir));
+  assert.throws(() => resolveWorkdir(path.join(dir, 'missing')), /no such directory/);
+  fs.writeFileSync(path.join(dir, 'file'), '');
+  assert.throws(() => resolveWorkdir(path.join(dir, 'file')), /not a directory/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('resolveAccess prefers the flag, then env, then the stored colleague', () => {
+  assert.equal(resolveAccess({ asked: 'read-only', env: 'full', stored: 'full' }), 'read-only');
+  assert.equal(resolveAccess({ asked: null, env: 'full', stored: 'read-only' }), 'full');
+  assert.equal(resolveAccess({ asked: null, env: '', stored: 'read-only' }), 'read-only');
+  assert.equal(resolveAccess({ asked: null, env: null, stored: null }), 'full');
+});
+
+test('resumeDecision starts a new tape when family, directory, or access changes', () => {
+  const meta = { sessionId: 's', harness: 'grok', cwd: '/tmp/a', access: 'full' };
+  assert.equal(resumeDecision({ meta, harnessId: 'grok', cwd: '/tmp/a', access: 'full' }).resume, true);
+  assert.equal(resumeDecision({ meta: { sessionId: null }, harnessId: 'grok', cwd: '/tmp/a', access: 'full' }).resume, false);
+  const family = resumeDecision({ meta, harnessId: 'claude', cwd: '/tmp/a', access: 'full' });
+  assert.equal(family.resume, false);
+  assert.match(family.reason, /claude/);
+  const dir = resumeDecision({ meta, harnessId: 'grok', cwd: '/tmp/b', access: 'full' });
+  assert.equal(dir.resume, false);
+  assert.match(dir.reason, /directory/);
+  const access = resumeDecision({ meta, harnessId: 'grok', cwd: '/tmp/a', access: 'read-only' });
+  assert.equal(access.resume, false);
+  assert.match(access.reason, /read-only/);
 });
 
 test('parseArgs reads --effort', () => {

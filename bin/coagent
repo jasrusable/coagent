@@ -88,7 +88,8 @@ Usage:
   coagent                        snapshot (status + recent consults)
   coagent log                    consults (your messages + inner replies)
   coagent watch [-f]             live tail of the inner transcript
-  coagent reset                  new inner session (old tape stays on disk)
+  coagent reset                  new tape for @main (named colleagues keep theirs)
+  coagent @name reset            new tape for that colleague (old tape stays on disk)
   coagent sessions               inner sessions for this lead
   coagent resume <id>            make an old inner session current
 
@@ -116,6 +117,8 @@ Options:
   --all                  wait: every colleague, printing each as it settles
   --model, -m   <id>     this-turn model override
   --effort, -e  <level>  this-turn effort override (minimal|low|medium|high|xhigh|max)
+  --cwd         <dir>    this colleague's directory (sticky; a change starts a new tape)
+  --readonly             read-only (sticky). --read-write clears it
   --brief-file <path>    read the message from a file ("-" = stdin)
   --timeout N            wait N seconds (wait only; default ${DEFAULT_WAIT_SEC})
   --follow, -f           watch: keep following after idle
@@ -123,8 +126,10 @@ Options:
 
   Send is background. Ctrl-C on wait/watch does not stop the inner agent.
   Busy send = steer (interrupt). Use \`later\` to queue.
-  Reset between unrelated jobs. It bypasses approvals; don't walk away
-  from destructive work.
+  \`coagent reset\` clears @main. \`coagent @name reset\` clears that colleague.
+  The default bypasses approvals. \`--readonly\` does not: Grok gets the
+  read-only sandbox and dontAsk; Claude gets dontAsk, write tools and MCP
+  removed, and a prompt is denied instead of asked.
 
   Prefer --brief-file for anything long: a brief passed as an argument is
   parsed by your shell first, and backticks in it are command substitution.
@@ -139,9 +144,9 @@ Options:
   \`workerModel:\` / \`workerEffort:\` for all of them, \`model.<agent>:\` /
   \`effort.<agent>:\` for one (cross-family ids are allowed).
 
-Env: COAGENT_HOME, COAGENT_MODEL, COAGENT_EFFORT, COAGENT_WORKER_MODEL,
-     COAGENT_WORKER_EFFORT, COAGENT_LEAD_SESSION_ID, COAGENT_LEAD_TRANSCRIPT,
-     GROK_SESSION_ID, CLAUDE_CODE_SESSION_ID
+Env: COAGENT_HOME, COAGENT_MODEL, COAGENT_EFFORT, COAGENT_CWD, COAGENT_ACCESS,
+     COAGENT_WORKER_MODEL, COAGENT_WORKER_EFFORT, COAGENT_LEAD_SESSION_ID,
+     COAGENT_LEAD_TRANSCRIPT, GROK_SESSION_ID, CLAUDE_CODE_SESSION_ID
 Home: ${ROOT}
 `);
 }
@@ -158,6 +163,44 @@ function resolveEffort({ asked, policy, lead, persona }) {
   return asked || policy || lead || persona || null;
 }
 
+function resolveWorkdir(raw) {
+  if (!raw) return null;
+  const abs = path.resolve(String(raw));
+  let st;
+  try { st = fs.statSync(abs); } catch {
+    fail(`no such directory ${raw}`);
+  }
+  if (!st.isDirectory()) fail(`${raw} is not a directory`);
+  // The process's cwd is the real path. The session is stored under the
+  // directory the child actually runs in, so a symlink and its target must
+  // not become two tapes.
+  try { return fs.realpathSync(abs); } catch { return abs; }
+}
+
+function resolveAccess({ asked, env, stored }) {
+  if (asked === 'read-only' || asked === 'full') return asked;
+  if (env === 'read-only' || env === 'full') return env;
+  if (stored === 'read-only' || stored === 'full') return stored;
+  return 'full';
+}
+
+// A grok or claude session is stored under the directory it was started in,
+// and a grok sandbox profile is fixed for that session. Resuming across either
+// change does not open the tape you think it does.
+function resumeDecision({ meta, harnessId, cwd, access }) {
+  if (!meta || !meta.sessionId) return { resume: false, reason: null };
+  if (meta.harness && meta.harness !== harnessId) {
+    return { resume: false, reason: `switching ${meta.harness} → ${harnessId}` };
+  }
+  if (meta.cwd && cwd && path.resolve(meta.cwd) !== path.resolve(cwd)) {
+    return { resume: false, reason: `switching directory ${meta.cwd} → ${cwd}` };
+  }
+  const prev = meta.access || 'full';
+  const next = access || 'full';
+  if (prev !== next) return { resume: false, reason: `switching ${prev} → ${next}` };
+  return { resume: true, reason: null };
+}
+
 function parseArgs(argv) {
   let agentName = null;
   let all = false;
@@ -167,6 +210,8 @@ function parseArgs(argv) {
   let timeoutSec = null;
   let worker = false;
   let briefFile = null;
+  let cwd = null;
+  let access = null;
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -179,7 +224,17 @@ function parseArgs(argv) {
       continue;
     }
     if (a.startsWith('--agent=')) { agentName = a.slice(8); continue; }
-    if (a.startsWith('@') && a.length > 1 && !rest.length) { agentName = a.slice(1); continue; }
+    // @name before the verb, or right after a verb that takes no id
+    // (`reset @name`). A later @word is part of the message.
+    if (a.startsWith('@') && a.length > 1) {
+      const afterVerb = rest.length === 1 && VERBS.has(rest[0]) && !['wait', 'resume', 'answer', 'asks'].includes(rest[0]);
+      if (!agentName && (rest.length === 0 || afterVerb)) {
+        const name = a.slice(1);
+        if (!AGENT_RE.test(name)) fail(`bad agent name ${name} — letters, digits, - and _ only`);
+        agentName = name;
+        continue;
+      }
+    }
     if (a === '--follow' || a === '-f') { follow = true; continue; }
     if (a === '--model' || a === '-m') {
       model = argv[++i];
@@ -193,6 +248,26 @@ function parseArgs(argv) {
     }
     if (a.startsWith('--effort=')) {
       effort = parseEffort(a.slice(9), '--effort');
+      continue;
+    }
+    if (a === '--cwd') {
+      cwd = argv[++i];
+      if (!cwd) fail('--cwd needs a directory');
+      continue;
+    }
+    if (a.startsWith('--cwd=')) {
+      cwd = a.slice(6);
+      if (!cwd) fail('--cwd needs a directory');
+      continue;
+    }
+    if (a === '--readonly' || a === '--read-only') {
+      if (access === 'full') fail('pass --readonly or --read-write, not both');
+      access = 'read-only';
+      continue;
+    }
+    if (a === '--read-write') {
+      if (access === 'read-only') fail('pass --readonly or --read-write, not both');
+      access = 'full';
       continue;
     }
     // A brief is prose the shell must not touch: backticks in an argv string
@@ -225,7 +300,7 @@ function parseArgs(argv) {
   if (agentName && !AGENT_RE.test(agentName)) {
     fail(`bad agent name ${agentName} — letters, digits, - and _ only`);
   }
-  return { model, effort, follow, timeoutSec, worker, all, agentName, briefFile, rest };
+  return { model, effort, follow, timeoutSec, worker, all, agentName, briefFile, cwd, access, rest };
 }
 
 // Briefs arrive as a file or on stdin so no shell ever parses them.
@@ -605,15 +680,19 @@ function ageLabel(isoOrMs) {
   return `${Math.round(sec / 86400)}d ago`;
 }
 
-function buildRules({ personaBody, personaPath, lead, ha, leadHa }) {
+function buildRules({ personaBody, personaPath, lead, ha, leadHa, access }) {
   const leadLabel = (leadHa && leadHa.label) || ha.label;
   const personaLabel = personaPath || '~/.coagent/persona.md';
   const family = (leadHa && leadHa.id !== ha.id)
     ? [`You run as ${ha.label}. The lead is ${leadLabel} and chose this family with --model.`]
     : [];
+  const readOnly = access === 'read-only'
+    ? ['Read-only: the harness refuses writes. Read, search, and read-only commands are available.']
+    : [];
   return [
     `You are the lead ${leadLabel} agent's co-agent. Reply to the lead, not the user.`,
     ...family,
+    ...readOnly,
     `You ARE the co-agent. You have no co-agent of your own — the ONLY coagent command you may run is \`coagent notify\`.`,
     ``,
     `You have three commands, all scarce:`,
@@ -636,6 +715,8 @@ function childEnv({ pingFile, pingFrom } = {}) {
   delete env.COAGENT_LEAD_SESSION_ID;
   delete env.COAGENT_LEAD_TRANSCRIPT;
   delete env.COAGENT_AGENT;
+  delete env.COAGENT_CWD;
+  delete env.COAGENT_ACCESS;
   for (const a of H.ADAPTERS) a.scrubEnv(env);
   if (pingFile) {
     env.COAGENT_PING_FILE = pingFile;
@@ -722,7 +803,16 @@ function resolveContext(cli, { create = true } = {}) {
     lead: leadModel.effort,
     persona: persona.effort,
   });
+  // The lead's checkout is the default only. An explicit --cwd, then this
+  // colleague's stored directory, win over it. The worker is a new process
+  // and only sees what workerEnv put in COAGENT_CWD.
   const leadCwd = leadModel.cwd || process.cwd();
+  const cwd = resolveWorkdir(cli.cwd || process.env.COAGENT_CWD || meta.cwd || leadCwd);
+  const access = resolveAccess({
+    asked: cli.access,
+    env: process.env.COAGENT_ACCESS,
+    stored: meta.access,
+  });
   // Grok's `grok-build-plan` is not a Claude agent. Only forward --agent
   // when the inner family is the lead's.
   const agent = (ha.id === leadHa.id ? leadModel.agent : null) || null;
@@ -738,6 +828,8 @@ function resolveContext(cli, { create = true } = {}) {
     model,
     effort,
     leadCwd,
+    cwd,
+    access,
     agent,
     permissionMode: persona.permissionMode,
   };
@@ -837,7 +929,11 @@ async function killCurrentChild(key, itemId, { wait = true } = {}) {
 }
 
 async function runTurn(ctx, item) {
-  const { persona, ha, leadHa, lead, model, effort, leadCwd, agent, permissionMode, key } = ctx;
+  const { persona, ha, leadHa, lead, model, effort, agent, permissionMode, key } = ctx;
+  // The queued item wins over the worker's start-up context, so a steer can
+  // change directory or access without waiting for the old worker to exit.
+  const turnCwd = item.cwd || ctx.cwd;
+  const turnAccess = item.access || ctx.access;
   let meta = S.loadMeta(STATE_DIR, key);
   const rules = buildRules({
     personaBody: persona.persona,
@@ -845,13 +941,13 @@ async function runTurn(ctx, item) {
     lead,
     ha,
     leadHa,
+    access: turnAccess,
   });
-  // A grok tape cannot be resumed as claude (or the reverse). Switching
-  // family starts a new inner session; the old tape stays on the roster.
-  const existing = !!meta.sessionId && (!meta.harness || meta.harness === ha.id);
-  if (meta.sessionId && meta.harness && meta.harness !== ha.id) {
-    console.error(`coagent: @${ctx.agentName} switching ${meta.harness} → ${ha.id}; new tape`);
+  const decision = resumeDecision({ meta, harnessId: ha.id, cwd: turnCwd, access: turnAccess });
+  if (meta.sessionId && !decision.resume && decision.reason) {
+    console.error(`coagent: @${ctx.agentName} ${decision.reason}; new tape`);
   }
+  const existing = decision.resume;
 
   const argsFor = ({ sid, resume, prompt }) => ha.buildArgs({
     prompt,
@@ -862,7 +958,8 @@ async function runTurn(ctx, item) {
     sessionId: sid,
     resume,
     agent,
-    cwd: leadCwd,
+    cwd: turnCwd,
+    access: turnAccess,
   });
 
   const mkNew = (prompt) => {
@@ -894,14 +991,14 @@ async function runTurn(ctx, item) {
 
   const bin = H.resolveBin(ha);
   const ping = { pingFile: pingsPath(lead.sessionId), pingFrom: ctx.agentName };
-  let res = await runCmd(bin, run.args, { onSpawn: stamp(run.sid), cwd: leadCwd, sessionId: run.sid, ha, ping });
+  let res = await runCmd(bin, run.args, { onSpawn: stamp(run.sid), cwd: turnCwd, sessionId: run.sid, ha, ping });
   if (abandoned()) return { interrupted: true };
 
   let forkedFrom = null;
   if (res.code !== 0 && existing) {
     const fresh = mkNew(prompt);
     console.error(`coagent: resume of ${meta.sessionId} failed (exit ${res.code}); starting a new tape ${fresh.sid}`);
-    const retry = await runCmd(bin, fresh.args, { onSpawn: stamp(fresh.sid), cwd: leadCwd, sessionId: fresh.sid, ha, ping });
+    const retry = await runCmd(bin, fresh.args, { onSpawn: stamp(fresh.sid), cwd: turnCwd, sessionId: fresh.sid, ha, ping });
     if (abandoned()) return { interrupted: true };
     if (retry.code === 0) {
       run = fresh;
@@ -921,7 +1018,7 @@ async function runTurn(ctx, item) {
   const dur = parsed.durMs != null ? `${(parsed.durMs / 1000).toFixed(1)}s` : null;
   const cost = parsed.costUsd != null ? `$${Number(parsed.costUsd).toFixed(4)}` : null;
   const turns = parsed.numTurns != null ? `${parsed.numTurns} turns` : null;
-  const inner = ha.sessionPaths(run.sid, leadCwd);
+  const inner = ha.sessionPaths(run.sid, turnCwd);
   const bits = [
     `lead=${lead.sessionId}`,
     `model=${model || ha.id}`,
@@ -946,7 +1043,7 @@ async function runTurn(ctx, item) {
   S.addToRoster(STATE_DIR, key, {
     id: run.sid,
     createdAt: new Date().toISOString(),
-    cwd: leadCwd,
+    cwd: turnCwd,
     model,
     harness: ha.id,
   });
@@ -955,7 +1052,8 @@ async function runTurn(ctx, item) {
     ...prevMeta,
     sessionId: run.sid,
     harness: ha.id,
-    cwd: leadCwd,
+    cwd: turnCwd,
+    access: turnAccess,
     model: model || null,
     effort: effort || null,
     agent: agent || null,
@@ -1045,6 +1143,8 @@ function workerEnv(ctx) {
   env.COAGENT_AGENT = ctx.agentName;
   if (ctx.model) env.COAGENT_MODEL = ctx.model;
   if (ctx.effort) env.COAGENT_EFFORT = ctx.effort;
+  if (ctx.cwd) env.COAGENT_CWD = ctx.cwd;
+  if (ctx.access) env.COAGENT_ACCESS = ctx.access;
   if (ctx.lead.transcriptPath) env.COAGENT_LEAD_TRANSCRIPT = ctx.lead.transcriptPath;
   env.COAGENT_HOME = ROOT;
   return env;
@@ -1054,7 +1154,7 @@ function spawnDetachedWorker(ctx) {
   const child = spawn(process.execPath, [__filename, '--worker'], {
     detached: true,
     stdio: 'ignore',
-    cwd: ctx.leadCwd || process.cwd(),
+    cwd: ctx.cwd || process.cwd(),
     env: workerEnv(ctx),
   });
   child.unref();
@@ -1085,7 +1185,7 @@ async function cmdSend(message, cli, { later = false } = {}) {
   let interrupted = null;
   if (running && !later) {
     interrupted = S.interruptRunning(STATE_DIR, key);
-    const item = S.enqueue(STATE_DIR, key, message, { front: true });
+    const item = S.enqueue(STATE_DIR, key, message, { front: true, cwd: ctx.cwd, access: ctx.access });
     await killCurrentChild(key, running.id);
     await ensureWorker(ctx);
     console.log(`co-agent: send-now  ${item.id}  (interrupted ${running.id})`);
@@ -1093,7 +1193,7 @@ async function cmdSend(message, cli, { later = false } = {}) {
     return;
   }
 
-  const item = S.enqueue(STATE_DIR, key, message, { front: false });
+  const item = S.enqueue(STATE_DIR, key, message, { front: false, cwd: ctx.cwd, access: ctx.access });
   await ensureWorker(ctx);
   const kind = running && later ? 'queued' : 'sent';
   const note = running && later ? `(behind ${running.id})` : '(starting)';
@@ -1109,6 +1209,8 @@ function printSendFooter(ctx, item) {
   const meta = S.loadMeta(STATE_DIR, ctx.key);
   const at = ctx.agentName === DEFAULT_AGENT ? '' : `@${ctx.agentName} `;
   if (meta.sessionId) console.log(`  inner: ${meta.sessionId}`);
+  if (ctx.cwd && ctx.cwd !== ctx.leadCwd) console.log(`  cwd: ${ctx.cwd}`);
+  if (ctx.access === 'read-only') console.log('  access: read-only');
   console.log(`  wait: coagent ${at}wait ${item.id}    watch: coagent ${at}watch`);
 }
 
@@ -1124,16 +1226,33 @@ function printConsult(item, { full = false } = {}) {
   }));
 }
 
+function innerTape(ctx) {
+  const meta = S.loadMeta(STATE_DIR, ctx.key);
+  const worker = S.readWorker(STATE_DIR, ctx.key);
+  const running = S.runningItem(STATE_DIR, ctx.key);
+  const sessionId = (worker && worker.sessionId) || meta.sessionId || null;
+  const cwd = (running && running.cwd) || meta.cwd || ctx.cwd;
+  return { meta, worker, running, sessionId, cwd, paths: ctx.ha.sessionPaths(sessionId, cwd) };
+}
+
 function makeUpdatePump(ctx) {
-  // ctx.key: each colleague has its own tape. Keyed on the lead, watch and
-  // wait tail @main's transcript no matter which colleague was addressed.
-  const initialMeta = S.loadMeta(STATE_DIR, ctx.key);
-  const initial = ctx.ha.sessionPaths(initialMeta.sessionId, ctx.leadCwd).transcript;
+  // Follow the session the worker is driving. meta.sessionId is only written
+  // when the turn finishes, so a wait that starts at "sent" would otherwise
+  // stay silent, and it would look in the lead's directory.
+  const initial = innerTape(ctx).paths.transcript;
   let seenPath = initial && fs.existsSync(initial) ? initial : null;
   let offset = seenPath ? fs.statSync(seenPath).size : 0;
+  let announced = false;
   return function pump() {
-    const m = S.loadMeta(STATE_DIR, ctx.key);
-    const p = ctx.ha.sessionPaths(m.sessionId, ctx.leadCwd).transcript;
+    const tape = innerTape(ctx);
+    const childUp = tape.worker && tape.worker.childPid
+      && S.tokenAlive(tape.worker.childToken || tape.worker.childPid);
+    if (!announced && childUp) {
+      announced = true;
+      const cost = typeof ctx.ha.runningCost === 'function' ? ctx.ha.runningCost(tape.paths) : null;
+      console.error(`co-agent: @${ctx.agentName} reading${cost != null ? `  $${cost.toFixed(3)}` : ''}`);
+    }
+    const p = tape.paths.transcript;
     if (!p || !fs.existsSync(p)) return;
     if (p !== seenPath) {
       offset = 0;
@@ -1237,7 +1356,8 @@ function cmdStatus(cli) {
   const live = inbox.filter(S.isLive);
   const w = S.readWorker(STATE_DIR, key);
   const workerOn = S.workerAlive(STATE_DIR, key);
-  const inner = ctx.ha.sessionPaths(meta.sessionId, ctx.leadCwd);
+  const tape = innerTape(ctx);
+  const inner = tape.paths;
   const innerInfo = ctx.ha.describeSession(inner);
 
   const family = ctx.leadHa && ctx.leadHa.id !== ctx.ha.id
@@ -1245,7 +1365,8 @@ function cmdStatus(cli) {
     : '';
   console.log(`co-agent: @${ctx.agentName}  lead=${ctx.lead.sessionId}  harness=${(ctx.leadHa || ctx.ha).id}${family}  pin=${ctx.lead.pin || '?'}`);
   console.log(`  inner: ${meta.sessionId || '(none — send a message to start one)'}${innerInfo.title ? `  "${innerInfo.title}"` : ''}`);
-  console.log(`  model: ${ctx.model || '(default)'}  effort=${ctx.effort || '?'}`);
+  console.log(`  model: ${ctx.model || '(default)'}  effort=${ctx.effort || '?'}${ctx.access === 'read-only' ? '  read-only' : ''}`);
+  console.log(`  cwd: ${ctx.cwd}`);
   console.log(`  worker: ${workerOn ? `pid=${w && w.pid}` : 'idle'}${w && w.childPid ? ` child=${w.childPid}` : ''}`);
   if (live.length) {
     console.log('  queue:');
@@ -1274,10 +1395,13 @@ function agentSummary(leadSessionId, name) {
   const meta = S.loadMeta(STATE_DIR, key);
   const inbox = S.loadInbox(STATE_DIR, key);
   const live = inbox.filter(S.isLive);
+  const worker = S.readWorker(STATE_DIR, key);
   const running = live.find((i) => i.status === 'running');
-  const state = running ? 'working' : (live.length ? `${live.length} queued` : 'idle');
+  const state = running
+    ? ((worker && worker.childPid) ? 'reading' : 'starting')
+    : (live.length ? `${live.length} queued` : 'idle');
   const last = S.sortInboxNewestFirst(inbox).find(itemSettled);
-  return { name, key, meta, live, running, state, last };
+  return { name, key, meta, live, running, state, last, worker };
 }
 
 function cmdAgents(cli) {
@@ -1292,13 +1416,21 @@ function cmdAgents(cli) {
   for (const name of names) {
     const a = agentSummary(ctx.lead.sessionId, name);
     if (a.running || a.live.length) inFlight += 1;
-    fleetCost += Number(a.meta.totalCostUsd || 0);
+    const ha = H.byId(a.meta.harness) || ctx.ha;
+    const sid = (a.worker && a.worker.sessionId) || a.meta.sessionId;
+    const costCwd = (a.running && a.running.cwd) || a.meta.cwd;
+    const liveCost = sid && typeof ha.runningCost === 'function'
+      ? ha.runningCost(ha.sessionPaths(sid, costCwd))
+      : null;
+    const dollars = liveCost != null ? liveCost : (a.meta.totalCostUsd ? Number(a.meta.totalCostUsd) : null);
+    if (dollars) fleetCost += dollars;
     const mark = name === ctx.agentName ? '*' : ' ';
-    const spend = a.meta.totalCostUsd ? `$${Number(a.meta.totalCostUsd).toFixed(3)}` : null;
+    const spend = dollars ? `$${dollars.toFixed(3)}` : null;
     const facts = [
       a.state,
       a.meta.harness && ctx.leadHa && a.meta.harness !== ctx.leadHa.id ? a.meta.harness : null,
       a.meta.model,
+      a.meta.access === 'read-only' ? 'read-only' : null,
       a.meta.effort && a.meta.effort !== 'high' ? a.meta.effort : null,
       a.running ? elapsedLabel(a.running.startedAt) : null,
       spend,
@@ -1375,7 +1507,7 @@ function cmdSessions(cli) {
   }
   for (const s of roster.sessions) {
     const mark = s.id === meta.sessionId ? '*' : ' ';
-    const info = ctx.ha.describeSession(ctx.ha.sessionPaths(s.id, s.cwd || ctx.leadCwd));
+    const info = ctx.ha.describeSession(ctx.ha.sessionPaths(s.id, s.cwd || ctx.cwd));
     console.log(
       `${mark} ${s.id}` +
       `${info.title ? `  ${info.title}` : ''}` +
@@ -1393,13 +1525,27 @@ function cmdResume(cli, id) {
   if (S.busy(STATE_DIR, key)) fail('busy — stop first, then resume');
   const roster = S.loadRoster(STATE_DIR, key);
   const meta = S.loadMeta(STATE_DIR, key);
-  const known = roster.sessions.some((s) => s.id === id) || meta.sessionId === id
-    || !!sessionPaths(id, ctx.leadCwd).transcript;
+  const prior = roster.sessions.find((s) => s.id === id);
+  const cwd = (prior && prior.cwd) || meta.cwd || ctx.cwd;
+  const known = !!prior || meta.sessionId === id
+    || !!sessionPaths(id, cwd).transcript;
   if (!known) fail(`unknown inner session: ${id}`);
-  S.addToRoster(STATE_DIR, key, { id, cwd: ctx.leadCwd, model: ctx.model, harness: ctx.ha.id });
+  S.addToRoster(STATE_DIR, key, { id, cwd, model: ctx.model, harness: ctx.ha.id });
   S.clearInbox(STATE_DIR, key);
-  S.saveMeta(STATE_DIR, key, { ...meta, sessionId: id, lastError: null });
+  S.saveMeta(STATE_DIR, key, { ...meta, sessionId: id, cwd, lastError: null });
   console.log(`co-agent: resumed ${id}`);
+}
+
+function clearAsksFrom(leadSessionId, agentName) {
+  const dir = asksDir(pingsPath(leadSessionId));
+  if (!fs.existsSync(dir)) return;
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith('.json')) continue;
+    const q = S.readJson(path.join(dir, f), null);
+    if (!q || q.from !== agentName) continue;
+    try { fs.rmSync(path.join(dir, f), { force: true }); } catch { /* */ }
+    try { fs.rmSync(path.join(dir, `${q.id}.answer`), { force: true }); } catch { /* */ }
+  }
 }
 
 function cmdReset(cli) {
@@ -1409,26 +1555,26 @@ function cmdReset(cli) {
   if (S.busy(STATE_DIR, key)) fail('busy — stop first, then reset');
   const meta = S.loadMeta(STATE_DIR, key);
   const old = meta.sessionId;
-  if (old) S.addToRoster(STATE_DIR, key, { id: old, cwd: meta.cwd || ctx.leadCwd, model: meta.model, harness: meta.harness || ctx.ha.id });
+  if (old) S.addToRoster(STATE_DIR, key, { id: old, cwd: meta.cwd || ctx.cwd, model: meta.model, harness: meta.harness || ctx.ha.id });
   S.clearInbox(STATE_DIR, key);
+  // Pings are the lead's shared log. Resetting one tape must not erase them.
+  clearAsksFrom(ctx.lead.sessionId, ctx.agentName);
   S.saveMeta(STATE_DIR, key, {
     ...S.emptyMeta(),
     harness: ctx.ha.id,
-    cwd: ctx.leadCwd,
+    cwd: ctx.cwd,
+    access: ctx.access,
     model: ctx.model,
     effort: ctx.effort,
     agent: ctx.agent,
   });
+  const who = ctx.agentName === DEFAULT_AGENT ? '' : `@${ctx.agentName} `;
   if (!old) {
-    console.log('co-agent: no inner session yet — next send starts one');
+    console.log(`co-agent: ${who}no inner session yet — next send starts one`);
     return;
   }
-  for (const f of [pingsPath(ctx.lead.sessionId), pingsCursorPath(ctx.lead.sessionId), followerPath(ctx.lead.sessionId)]) {
-    try { fs.rmSync(f, { force: true }); } catch { /* */ }
-  }
-  try { fs.rmSync(asksDir(pingsPath(ctx.lead.sessionId)), { recursive: true, force: true }); } catch { /* */ }
-  console.log(`co-agent: reset  archived ${old}`);
-  console.log('  old tape kept. resume it with: coagent resume <id>');
+  console.log(`co-agent: reset ${who} archived ${old}`);
+  console.log(`  old tape kept. resume it with: coagent ${who}resume ${old}`);
 }
 
 function cmdLog(cli) {
@@ -1444,10 +1590,10 @@ function cmdLog(cli) {
 async function cmdWatch(cli) {
   const ctx = resolveContext(cli, { create: false });
   const key = ctx.key;
-  const meta = S.loadMeta(STATE_DIR, key);
   const follow = !!cli.follow;
-  let p = ctx.ha.sessionPaths(meta.sessionId, ctx.leadCwd).transcript;
-  console.error(`watching ${meta.sessionId || '(waiting)'} · ${p || '(no tape yet)'} · follow=${follow}`);
+  const tape = innerTape(ctx);
+  const p = tape.paths.transcript;
+  console.error(`watching ${tape.sessionId || '(waiting)'} · ${p || '(no tape yet)'} · follow=${follow}`);
   const pump = makeUpdatePump(ctx);
 
   for (;;) {
@@ -1495,6 +1641,8 @@ async function main() {
     timeoutSec: parsed.timeoutSec,
     agentName: parsed.agentName,
     all: parsed.all,
+    cwd: parsed.cwd,
+    access: parsed.access,
   };
   const brief = parsed.briefFile ? readBrief(parsed.briefFile) : null;
   // A brief replaces the message, so inline text alongside it is ambiguous
@@ -1553,6 +1701,9 @@ if (require.main === module) {
 module.exports = {
   parseArgs,
   resolveEffort,
+  resolveWorkdir,
+  resolveAccess,
+  resumeDecision,
   buildRules,
   parseResult,
   loadPersona,

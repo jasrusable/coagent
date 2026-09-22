@@ -468,6 +468,203 @@ echo '{"session_id":"22222222-1111-2222-3333-444444444444","result":"inner says 
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+function writeLead(home, sid, infoCwd) {
+  const grokHome = path.join(home, 'grok');
+  const dir = path.join(grokHome, 'sessions', encodeURIComponent(process.cwd()), sid);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'updates.jsonl'), '');
+  fs.writeFileSync(path.join(dir, 'chat_history.jsonl'), '');
+  fs.writeFileSync(path.join(dir, 'summary.json'), JSON.stringify({
+    current_model_id: 'grok-4.6',
+    reasoning_effort: 'medium',
+    info: infoCwd ? { cwd: infoCwd } : {},
+  }));
+  fs.writeFileSync(path.join(home, 'persona.md'), 'You are a test colleague.\n');
+  return grokHome;
+}
+
+function writeFakeGrok(binDir, { argLog, pwdLog, delayMs = 0, toolDelayMs = 0 }) {
+  const script = `#!/usr/bin/env node
+const fs = require('fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(argLog)}, args.join('\\n') + '\\n---\\n');
+${pwdLog ? `fs.appendFileSync(${JSON.stringify(pwdLog)}, process.cwd() + '\\n');` : ''}
+let sid = null, cwd = null;
+for (let i = 0; i < args.length; i++) {
+  if ((args[i] === '--session-id' || args[i] === '--resume') && args[i + 1]) sid = args[i + 1];
+  if (args[i] === '--cwd' && args[i + 1]) cwd = args[i + 1];
+}
+const home = process.env.GROK_HOME;
+if (sid && cwd && home) {
+  const dir = home + '/sessions/' + encodeURIComponent(cwd) + '/' + sid;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(dir + '/usage.json', JSON.stringify({ session: { costUsdTicks: 126890500 } }));
+  const line = JSON.stringify({ params: { update: { sessionUpdate: 'tool_call', title: 'read_file', rawInput: { target_file: 'a.js' } } } }) + '\\n';
+  const write = () => fs.appendFileSync(dir + '/updates.jsonl', line);
+  if (${toolDelayMs} > 0) setTimeout(write, ${toolDelayMs});
+  else write();
+}
+setTimeout(() => {
+  process.stdout.write(JSON.stringify({ sessionId: sid, result: 'ok', durationMs: 1 }));
+  process.exit(0);
+}, ${delayMs});
+`;
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'grok'), script, { mode: 0o755 });
+}
+
+function leadEnv(home, grokHome, binDir, sid) {
+  return {
+    ...process.env,
+    ...CLEAN,
+    PATH: `${binDir}:${process.env.PATH}`,
+    COAGENT_HOME: home,
+    GROK_HOME: grokHome,
+    GROK_SESSION_ID: sid,
+    COAGENT_CWD: '',
+    COAGENT_ACCESS: '',
+    COAGENT_MODEL: '',
+    COAGENT_EFFORT: '',
+    COAGENT_AGENT: '',
+  };
+}
+
+test('--cwd beats the lead checkout, sticks, and a change starts a new tape', async () => {
+  const home = tmp();
+  const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-a-'));
+  const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-b-'));
+  const sid = '88888888-1111-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid, dirA);
+  const binDir = path.join(home, 'fakebin');
+  const argLog = path.join(home, 'args.txt');
+  const pwdLog = path.join(home, 'pwd.txt');
+  writeFakeGrok(binDir, { argLog, pwdLog });
+  const env = leadEnv(home, grokHome, binDir, sid);
+
+  const realB = fs.realpathSync(dirB);
+  const sent = await runCoagent(['--cwd', dirB, 'look'], env);
+  assert.equal(sent.code, 0, sent.err || sent.out);
+  const waited = await runCoagent(['wait', '--timeout', '15'], env);
+  assert.equal(waited.code, 0, waited.err || waited.out);
+  assert.equal(fs.readFileSync(pwdLog, 'utf8').trim(), realB);
+  assert.match(fs.readFileSync(argLog, 'utf8'), new RegExp(`--cwd\\n${realB.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+
+  fs.writeFileSync(argLog, '');
+  fs.writeFileSync(pwdLog, '');
+  assert.equal((await runCoagent(['again'], env)).code, 0);
+  assert.equal((await runCoagent(['wait', '--timeout', '15'], env)).code, 0);
+  const stuck = fs.readFileSync(argLog, 'utf8');
+  assert.ok(stuck.includes('--resume'), stuck);
+  assert.ok(stuck.includes(realB), stuck);
+  assert.equal(fs.readFileSync(pwdLog, 'utf8').trim(), realB);
+
+  fs.writeFileSync(argLog, '');
+  fs.writeFileSync(pwdLog, '');
+  assert.equal((await runCoagent(['--cwd', dirA, 'move'], env)).code, 0);
+  assert.equal((await runCoagent(['wait', '--timeout', '15'], env)).code, 0);
+  const moved = fs.readFileSync(argLog, 'utf8');
+  assert.ok(moved.includes('--session-id'), moved);
+  assert.ok(!moved.includes('--resume'), moved);
+  assert.equal(fs.readFileSync(pwdLog, 'utf8').trim(), fs.realpathSync(dirA));
+
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(dirA, { recursive: true, force: true });
+  fs.rmSync(dirB, { recursive: true, force: true });
+});
+
+test('reset @name starts a new tape and bare reset does not', async () => {
+  const home = tmp();
+  const sid = '99999999-1111-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const binDir = path.join(home, 'fakebin');
+  const argLog = path.join(home, 'args.txt');
+  writeFakeGrok(binDir, { argLog });
+  const env = leadEnv(home, grokHome, binDir, sid);
+
+  assert.equal((await runCoagent(['@fable', 'hello'], env)).code, 0);
+  assert.equal((await runCoagent(['@fable', 'wait', '--timeout', '15'], env)).code, 0);
+  const metaPath = path.join(home, 'state', sid, 'agents', 'fable', 'meta.json');
+  const before = JSON.parse(fs.readFileSync(metaPath, 'utf8')).sessionId;
+  assert.ok(before);
+
+  const ping = path.join(home, 'state', sid, 'pings.jsonl');
+  fs.writeFileSync(ping, '{"from":"other","text":"keep"}\n');
+
+  assert.equal((await runCoagent(['reset'], env)).code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(metaPath, 'utf8')).sessionId, before);
+
+  const named = await runCoagent(['reset', '@fable'], env);
+  assert.equal(named.code, 0, named.err || named.out);
+  assert.match(named.out, new RegExp(`archived ${before}`));
+  assert.equal(JSON.parse(fs.readFileSync(metaPath, 'utf8')).sessionId, null);
+  assert.equal(fs.readFileSync(ping, 'utf8').includes('keep'), true);
+
+  fs.writeFileSync(argLog, '');
+  assert.equal((await runCoagent(['@fable', 'again'], env)).code, 0);
+  const waited = await runCoagent(['@fable', 'wait', '--timeout', '15'], env);
+  assert.equal(waited.code, 0, waited.err || waited.out);
+  const args = fs.readFileSync(argLog, 'utf8');
+  assert.ok(args.includes('--session-id'), args);
+  assert.ok(!args.includes('--resume'), args);
+  assert.ok(!args.includes(before), args);
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('--readonly sticks and --read-write clears it', async () => {
+  const home = tmp();
+  const sid = 'aaaaaaaa-2222-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const binDir = path.join(home, 'fakebin');
+  const argLog = path.join(home, 'args.txt');
+  writeFakeGrok(binDir, { argLog });
+  const env = leadEnv(home, grokHome, binDir, sid);
+  const last = () => fs.readFileSync(argLog, 'utf8').trim().split('---').filter(Boolean).pop();
+
+  assert.equal((await runCoagent(['--readonly', 'look'], env)).code, 0);
+  assert.equal((await runCoagent(['wait', '--timeout', '15'], env)).code, 0);
+  let block = last();
+  assert.match(block, /--sandbox\nread-only/);
+  assert.match(block, /--permission-mode\ndontAsk/);
+  assert.ok(!block.includes('--always-approve'), block);
+
+  fs.writeFileSync(argLog, '');
+  assert.equal((await runCoagent(['again'], env)).code, 0);
+  assert.equal((await runCoagent(['wait', '--timeout', '15'], env)).code, 0);
+  block = last();
+  assert.match(block, /--sandbox\nread-only/);
+  assert.match(block, /--resume/);
+
+  fs.writeFileSync(argLog, '');
+  assert.equal((await runCoagent(['--read-write', 'edit'], env)).code, 0);
+  assert.equal((await runCoagent(['wait', '--timeout', '15'], env)).code, 0);
+  block = last();
+  assert.ok(block.includes('--always-approve'), block);
+  assert.ok(!block.includes('--sandbox'), block);
+  assert.ok(!block.includes('--resume'), block);
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('wait says reading once the inner process is up', async () => {
+  const home = tmp();
+  const sid = 'bbbbbbbb-2222-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const binDir = path.join(home, 'fakebin');
+  const argLog = path.join(home, 'args.txt');
+  writeFakeGrok(binDir, { argLog, delayMs: 1200, toolDelayMs: 400 });
+  const env = leadEnv(home, grokHome, binDir, sid);
+
+  assert.equal((await runCoagent(['look'], env)).code, 0);
+  const waited = await runCoagent(['wait', '--timeout', '15'], env);
+  assert.equal(waited.code, 0, waited.err || waited.out);
+  assert.match(waited.err, /@main reading/);
+  assert.match(waited.err, /read_file/);
+  assert.match(waited.out, /ok/);
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 (async () => {
   for (const t of tests) {
     try {
