@@ -18,7 +18,8 @@ This checkout is the source. Runtime home is `~/.coagent/` (`state/` is not in g
 | `lib/render.js` | Watch/log pretty-print |
 | `test/` | Unit + concurrency tests |
 | `persona.md` | Last-layer rules (seeded if missing) |
-| `install.sh` | Copy code into home; leave `state/` alone |
+| `skills/coagent/SKILL.md` | Agent skill. Install copies it to `~/.grok/skills/coagent` and links `~/.claude/skills/coagent` there |
+| `install.sh` | Copy code into home and install the skill; leave `state/` and an existing `persona.md` alone |
 
 ## Rules
 

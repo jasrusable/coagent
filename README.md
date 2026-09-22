@@ -30,6 +30,7 @@ One colleague **per harness session**. Send is background. The inner session per
 - **Checkout:** `~/projects/coagent`
 - **Home:** `~/.coagent/` (`state/` is not in git)
 - **Binary:** `~/.local/bin/coagent`
+- **Skill:** `~/.grok/skills/coagent/SKILL.md`, with `~/.claude/skills/coagent` linked to that directory
 
 ## Install
 
