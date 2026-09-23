@@ -646,6 +646,88 @@ test('--readonly sticks and --read-write clears it', async () => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test('agents shows the running turn, not the previous tape', async () => {
+  const home = tmp();
+  const sid = '12121212-1111-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const state = path.join(home, 'state');
+  const key = path.join(sid, 'agents', 'fable');
+  const S = require('../lib/session.js');
+  S.ensureLead(state, key);
+  S.saveMeta(state, key, {
+    ...S.loadMeta(state, key),
+    harness: 'grok',
+    model: 'grok-4.6',
+    cwd: process.cwd(),
+    access: 'full',
+  });
+  const item = S.enqueue(state, key, 'review the diff', {
+    model: 'fable',
+    harness: 'claude',
+    access: 'read-only',
+    cwd: '/tmp/wt',
+  });
+  S.updateItem(state, key, item.id, {
+    status: 'running',
+    startedAt: new Date().toISOString(),
+  });
+  // A running row with no live worker is reaped. Hold the lock so the roster
+  // still shows this turn instead of falling back to the previous tape.
+  S.tryLock(state, key, process.pid);
+  S.writeWorker(state, key, { pid: process.pid, childPid: process.pid, itemId: item.id });
+  const listed = await runCoagent(['agents'], leadEnv(home, grokHome, path.join(home, 'bin'), sid));
+  assert.equal(listed.code, 0, listed.err || listed.out);
+  assert.match(listed.out, /@fable\s+reading\s+claude\s+fable\s+read-only/);
+  assert.ok(!listed.out.includes('grok-4.6'), listed.out);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('wait id finds the lead when several Grok sessions share the cwd', async () => {
+  const home = tmp();
+  const sidA = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  const sidB = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+  const grokHome = writeLead(home, sidA);
+  const dirB = path.join(grokHome, 'sessions', encodeURIComponent(process.cwd()), sidB);
+  fs.mkdirSync(dirB, { recursive: true });
+  fs.writeFileSync(path.join(dirB, 'updates.jsonl'), '');
+  fs.writeFileSync(path.join(grokHome, 'active_sessions.json'), JSON.stringify([
+    { session_id: sidA, cwd: process.cwd() },
+    { session_id: sidB, cwd: process.cwd() },
+  ]));
+  const state = path.join(home, 'state');
+  const key = path.join(sidA, 'agents', 'fable');
+  const S = require('../lib/session.js');
+  S.ensureLead(state, key);
+  const item = S.enqueue(state, key, 'review', { model: 'fable', harness: 'claude' });
+  S.updateItem(state, key, item.id, {
+    status: 'done',
+    finishedAt: new Date().toISOString(),
+    answer: 'no significant issues',
+  });
+  const env = {
+    ...process.env,
+    ...CLEAN,
+    COAGENT_HOME: home,
+    GROK_HOME: grokHome,
+    COAGENT_CWD: '',
+    COAGENT_ACCESS: '',
+    COAGENT_MODEL: '',
+    COAGENT_EFFORT: '',
+    COAGENT_AGENT: '',
+  };
+  const waited = await runCoagent(['@fable', 'wait', item.id, '--timeout', '5'], env);
+  assert.equal(waited.code, 0, waited.err || waited.out);
+  assert.match(waited.out, /no significant issues/);
+
+  S.ensureLead(state, path.join(sidB, 'agents', 'fable'));
+  S.saveInbox(state, path.join(sidB, 'agents', 'fable'), S.loadInbox(state, key));
+  const again = await runCoagent(['@fable', 'wait', item.id, '--timeout', '5'], env);
+  assert.notEqual(again.code, 0);
+  assert.match(`${again.err}\n${again.out}`, /no lead session found/);
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test('wait says reading once the inner process is up', async () => {
   const home = tmp();
   const sid = 'bbbbbbbb-2222-2222-3333-444444444444';

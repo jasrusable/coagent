@@ -84,7 +84,7 @@ Usage:
   coagent later "…"              queue for after the current turn
   coagent stop                   kill the running turn; queue stays
   coagent wait [--timeout N]     stream until idle; print turns that finished
-  coagent wait <id>              stream until that turn finishes; print it
+  coagent wait <id>              that turn; finds it when several leads share this checkout
   coagent                        snapshot (status + recent consults)
   coagent log                    consults (your messages + inner replies)
   coagent watch [-f]             live tail of the inner transcript
@@ -1175,6 +1175,35 @@ async function ensureWorker(ctx) {
 
 function clip(s, n) { return R.clip(s, n, HOME); }
 
+function turnFields(ctx, front) {
+  return {
+    front,
+    cwd: ctx.cwd,
+    access: ctx.access,
+    model: ctx.model,
+    harness: ctx.ha.id,
+  };
+}
+
+// Several Grok sessions often share one checkout, and a helper process may not
+// have GROK_SESSION_ID. An item id belongs to one inbox, so wait can pin that
+// lead instead of refusing to guess. A session id already in the environment
+// still wins.
+function pinLeadFromItem(cli, itemId) {
+  if (!itemId) return;
+  if (
+    process.env.COAGENT_LEAD_SESSION_ID
+    || process.env.GROK_SESSION_ID
+    || process.env.CLAUDE_CODE_SESSION_ID
+  ) return;
+  const r = H.resolve();
+  if (!r.error) return;
+  const hits = S.findLeadByItemId(STATE_DIR, itemId, cli.agentName || null);
+  if (hits.length !== 1) return;
+  process.env.COAGENT_LEAD_SESSION_ID = hits[0].leadSessionId;
+  if (!cli.agentName) cli.agentName = hits[0].agentName;
+}
+
 async function cmdSend(message, cli, { later = false } = {}) {
   if (!String(message || '').trim()) fail('usage: coagent "…"  or  coagent later "…"');
   const ctx = resolveContext(cli);
@@ -1185,7 +1214,7 @@ async function cmdSend(message, cli, { later = false } = {}) {
   let interrupted = null;
   if (running && !later) {
     interrupted = S.interruptRunning(STATE_DIR, key);
-    const item = S.enqueue(STATE_DIR, key, message, { front: true, cwd: ctx.cwd, access: ctx.access });
+    const item = S.enqueue(STATE_DIR, key, message, turnFields(ctx, true));
     await killCurrentChild(key, running.id);
     await ensureWorker(ctx);
     console.log(`co-agent: send-now  ${item.id}  (interrupted ${running.id})`);
@@ -1193,7 +1222,7 @@ async function cmdSend(message, cli, { later = false } = {}) {
     return;
   }
 
-  const item = S.enqueue(STATE_DIR, key, message, { front: false, cwd: ctx.cwd, access: ctx.access });
+  const item = S.enqueue(STATE_DIR, key, message, turnFields(ctx, false));
   await ensureWorker(ctx);
   const kind = running && later ? 'queued' : 'sent';
   const note = running && later ? `(behind ${running.id})` : '(starting)';
@@ -1416,9 +1445,13 @@ function cmdAgents(cli) {
   for (const name of names) {
     const a = agentSummary(ctx.lead.sessionId, name);
     if (a.running || a.live.length) inFlight += 1;
-    const ha = H.byId(a.meta.harness) || ctx.ha;
+    const turn = a.running || a.live[0] || null;
+    const harnessId = (turn && turn.harness) || a.meta.harness;
+    const model = (turn && turn.model) || a.meta.model;
+    const access = (turn && turn.access) || a.meta.access;
+    const ha = H.byId(harnessId) || ctx.ha;
     const sid = (a.worker && a.worker.sessionId) || a.meta.sessionId;
-    const costCwd = (a.running && a.running.cwd) || a.meta.cwd;
+    const costCwd = (turn && turn.cwd) || a.meta.cwd;
     const liveCost = sid && typeof ha.runningCost === 'function'
       ? ha.runningCost(ha.sessionPaths(sid, costCwd))
       : null;
@@ -1428,9 +1461,9 @@ function cmdAgents(cli) {
     const spend = dollars ? `$${dollars.toFixed(3)}` : null;
     const facts = [
       a.state,
-      a.meta.harness && ctx.leadHa && a.meta.harness !== ctx.leadHa.id ? a.meta.harness : null,
-      a.meta.model,
-      a.meta.access === 'read-only' ? 'read-only' : null,
+      harnessId && ctx.leadHa && harnessId !== ctx.leadHa.id ? harnessId : null,
+      model,
+      access === 'read-only' ? 'read-only' : null,
       a.meta.effort && a.meta.effort !== 'high' ? a.meta.effort : null,
       a.running ? elapsedLabel(a.running.startedAt) : null,
       spend,
@@ -1679,6 +1712,7 @@ async function main() {
   if (verb === 'later') return await cmdSend(sendText(rest.slice(1)), cli, { later: true });
   if (verb === 'now') return await cmdSend(sendText(rest.slice(1)), cli, { later: false });
   if (verb === 'stop') return await cmdStop(cli);
+  if (verb === 'wait' && !cli.all && rest[1]) pinLeadFromItem(cli, rest[1]);
   if (verb === 'wait') return cli.all ? await cmdWaitAll(cli) : await cmdWait(cli, rest[1]);
   if (verb === 'agents') return cmdAgents(cli);
   if (verb === 'watch') return await cmdWatch(cli);

@@ -35,7 +35,7 @@ This checkout is the source. Runtime home is `~/.coagent/` (`state/` is not in g
 - Questions (`asks`) print whole, never clipped — a clipped question gets answered on a guess. `asks <id>` shows one, answered or not.
 - Claude Code leads: `pings --follow` once per session; `agents` warns if in-flight work has no follower.
 - Send returns immediately. Busy send interrupts. `later` queues. `stop` kills the running turn.
-- `wait` streams the inner tape, then prints consults that finished (`wait <id>` for one turn).
+- `wait` streams the inner tape, then prints consults that finished (`wait <id>` for one turn). `wait <id>` finds that turn when several lead sessions share the checkout and no session id is in the environment. `agents` shows the running turn's model and access, not the previous tape's meta.
 - Inner system prompt every turn: identity + lead transcript paths + labeled `persona.md` (grok `--rules`, claude `--append-system-prompt`). Project AGENTS.md / CLAUDE.md come from the colleague's cwd.
 - `--readonly` sticks on that colleague. Grok runs `--sandbox read-only` and `dontAsk`, without `--always-approve`. Claude runs `dontAsk`, `--permission-prompts none`, no MCP, and its write and subagent tools removed. Bash stays; a command the vendor does not already treat as a read is denied. `--read-write` clears it. Changing access starts a new tape. `coagent reset` clears `@main` only; `coagent @name reset` clears that colleague.
 - After changing `bin/` or `lib/`, run `./install.sh` and `npm test`.

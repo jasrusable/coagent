@@ -65,6 +65,24 @@ test('interrupt does not drop queued items', () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test('findLeadByItemId returns the one inbox that holds the id', () => {
+  const root = tmpState();
+  const a = path.join('lead-a', 'agents', 'fable');
+  const b = path.join('lead-b', 'agents', 'fable');
+  S.ensureLead(root, a);
+  S.ensureLead(root, b);
+  const item = S.enqueue(root, a, 'review', { model: 'fable', harness: 'claude', access: 'read-only' });
+  assert.equal(item.model, 'fable');
+  assert.equal(item.harness, 'claude');
+  assert.deepEqual(S.findLeadByItemId(root, item.id), [
+    { leadSessionId: 'lead-a', agentName: 'fable' },
+  ]);
+  assert.deepEqual(S.findLeadByItemId(root, item.id, 'main'), []);
+  S.saveInbox(root, b, S.loadInbox(root, a));
+  assert.equal(S.findLeadByItemId(root, item.id).length, 2);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('addToRoster does not duplicate', () => {
   const root = tmpState();
   const lead = 'lead-r';
