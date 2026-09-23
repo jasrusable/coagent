@@ -1,17 +1,21 @@
 ---
 name: coagent
 description: >
-  Coagent is your standing inner agent (@main): same working tree, own
-  persistent session, replies to you not the user. Send is background and
-  returns immediately; the tape continues until reset. That lets you keep
-  talking to the user while a colleague reviews, stress-tests, or works
-  in parallel, and hand a job to a different model family or effort
-  (--model fable, opus, grok; --effort higher or lower).
+  A persistent named sub-agent. You give it a name, it works in the
+  background on the same files you have open, and its conversation
+  continues until you reset it, so a later message is a follow-up to
+  that same agent. You send a task. The command returns immediately,
+  with an id, before the work is finished. It writes its answer back
+  to you, not to the user. You can have up to six. Each can use a
+  different model from you: fable and opus run as Claude, grok-* runs
+  as Grok. Unless you pass --readonly, it may edit the repo and it
+  skips approval prompts.
 when-to-use: >
-  Reviews; stress-test the thing in front of you (code, idea, requirement,
-  whatever it is); parallel work (keep talking to the user, or several
-  named colleagues at once); hand a job to a smarter, cheaper, or
-  different-family model at higher or lower effort.
+  A code review, a second look at a change, or a long look through the
+  repo that should go on while you keep talking to the user. Also when
+  you want a named agent you can send follow-ups to, when that work
+  should be done by a different model, or when several of those agents
+  should run at the same time.
 ---
 
 # Co-agent
@@ -36,10 +40,9 @@ harness and sticks on that colleague.
 Do not run `spawn_subagent` and `coagent` on the same job. The user talks
 only to you; you manage the colleagues.
 
-- **Grok lead:** `spawn_subagent` for Grok-family work. `coagent` for
-  persistent named tapes and for `--model fable` / `opus`.
-- **Claude Code lead:** `coagent` is the inner-agent path. `wait` is a
-  blocking stream — background it.
+A Claude lead backgrounds `wait` because it blocks. A Grok lead backgrounds
+`coagent @name wait <id>` in the same shell. A login shell (`bash -lc`) does
+not see the session id.
 
 `coagent doctor` prints which lead you are.
 
@@ -76,10 +79,10 @@ Keep talking to the user after send. Collect the answer when you need it:
 | `coagent watch` | Raw inner transcript |
 | `coagent agents` | Roster, state, elapsed, spend |
 
-`wait <id>` prints that consult when the turn finishes. That output is the
-result. Background it when a long command would be parked, and read the
-output when it completes. `agents` shows `starting` until the inner process
-is up, then `reading`, with cost once the vendor has reported any.
+`wait <id>` finds that turn when several leads share this checkout and no
+session id is set, and refuses when the id is missing or in more than one
+inbox. `agents` shows the running turn's model and read-only flag, not the
+previous tape: `starting` until the inner process is up, then `reading`.
 
 ## Tapes
 
@@ -130,6 +133,6 @@ coagent asks
 coagent answer <id> "…"
 ```
 
-Grok already wakes you when a background agent finishes. Do not arm a
-follower. On a Grok lead, workers are told to finish the turn rather than
-`ask` / `notify`, because there is usually nobody listening mid-turn.
+A coagent turn does not wake a Grok lead. Background `coagent @name wait <id>`
+to collect it. Do not arm `pings --follow`. Workers finish the turn instead
+of `ask` / `notify`.
