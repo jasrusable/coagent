@@ -38,6 +38,7 @@ function loadLib(name) {
 const S = loadLib('session.js');
 const R = loadLib('render.js');
 const H = loadLib('harness/index.js');
+const C = loadLib('changes.js');
 
 function fail(msg) {
   const text = `coagent: ${msg}`;
@@ -119,6 +120,7 @@ Options:
   --effort, -e  <level>  this-turn effort override (minimal|low|medium|high|xhigh|max)
   --cwd         <dir>    this colleague's directory (sticky; a change starts a new tape)
   --readonly             read-only (sticky). --read-write clears it
+  --readonly-unenforced  Grok without its sandbox; asked not to write, NOT stopped (sticky)
   --brief-file <path>    read the message from a file ("-" = stdin)
   --timeout N            wait N seconds (wait only; default ${DEFAULT_WAIT_SEC})
   --follow, -f           watch: keep following after idle
@@ -130,6 +132,15 @@ Options:
   The default bypasses approvals. \`--readonly\` does not: Grok gets the
   read-only sandbox and dontAsk; Claude gets dontAsk, write tools and MCP
   removed, and a prompt is denied instead of asked.
+
+  Grok's sandbox will not start when a socket on its fixed deny list is a
+  symlink out of that list (OrbStack: /var/run/docker.sock →
+  ~/.orbstack/run/docker.sock). A Grok --readonly send then fails rather
+  than drop the sandbox. Use \`--model opus --readonly\`, or
+  \`--readonly-unenforced\`: Grok with no sandbox and dontAsk, told not to
+  write. That is NOT enforced; coagent checks the git tree after each turn
+  and flags any change (edits by anyone in that tree count). On Claude
+  models it is the same as --readonly.
 
   Prefer --brief-file for anything long: a brief passed as an argument is
   parsed by your shell first, and backticks in it are command substitution.
@@ -177,11 +188,18 @@ function resolveWorkdir(raw) {
   try { return fs.realpathSync(abs); } catch { return abs; }
 }
 
+const ACCESS = new Set(['full', 'read-only', 'read-only-unenforced']);
+
 function resolveAccess({ asked, env, stored }) {
-  if (asked === 'read-only' || asked === 'full') return asked;
-  if (env === 'read-only' || env === 'full') return env;
-  if (stored === 'read-only' || stored === 'full') return stored;
-  return 'full';
+  return [asked, env, stored].find((a) => ACCESS.has(a)) || 'full';
+}
+
+// What the lead sees. The adapter decides whether read-only is enforced, so a
+// Claude colleague on --readonly-unenforced reads as plain read-only.
+function accessLabel(access, ha) {
+  const kind = ha.readOnlyKind(access);
+  if (kind === 'unenforced') return 'read-only (unenforced)';
+  return kind ? 'read-only' : null;
 }
 
 // A grok or claude session is stored under the directory it was started in,
@@ -200,6 +218,14 @@ function resumeDecision({ meta, harnessId, cwd, access }) {
   if (prev !== next) return { resume: false, reason: `switching ${prev} → ${next}` };
   return { resume: true, reason: null };
 }
+
+const ACCESS_FLAGS = {
+  '--readonly': 'read-only',
+  '--read-only': 'read-only',
+  '--readonly-unenforced': 'read-only-unenforced',
+  '--read-only-unenforced': 'read-only-unenforced',
+  '--read-write': 'full',
+};
 
 function parseArgs(argv) {
   let agentName = null;
@@ -260,14 +286,10 @@ function parseArgs(argv) {
       if (!cwd) fail('--cwd needs a directory');
       continue;
     }
-    if (a === '--readonly' || a === '--read-only') {
-      if (access === 'full') fail('pass --readonly or --read-write, not both');
-      access = 'read-only';
-      continue;
-    }
-    if (a === '--read-write') {
-      if (access === 'read-only') fail('pass --readonly or --read-write, not both');
-      access = 'full';
+    const accessFlag = ACCESS_FLAGS[a];
+    if (accessFlag) {
+      if (access && access !== accessFlag) fail('pass one of --readonly, --readonly-unenforced, --read-write');
+      access = accessFlag;
       continue;
     }
     // A brief is prose the shell must not touch: backticks in an argv string
@@ -686,8 +708,16 @@ function buildRules({ personaBody, personaPath, lead, ha, leadHa, access }) {
   const family = (leadHa && leadHa.id !== ha.id)
     ? [`You run as ${ha.label}. The lead is ${leadLabel} and chose this family with --model.`]
     : [];
-  const readOnly = access === 'read-only'
+  const readOnlyKind = ha.readOnlyKind(access);
+  const readOnly = readOnlyKind === 'enforced'
     ? ['Read-only: the harness refuses writes. Read, search, and read-only commands are available.']
+    : [];
+  // Last, after the persona, so nothing in it reads as permission to write.
+  const unenforced = readOnlyKind === 'unenforced'
+    ? [
+      ``,
+      `READ-ONLY TURN. Nothing in the harness enforces this, so it is on you. Do not create, edit, move, or delete any file. No git commit, push, checkout, stash, reset, or add. No package installs. No network writes (POST/PUT/DELETE, deploys, sending messages). Read, search, and run read-only commands only. If the job needs a write, say so in your answer instead. The working tree is checked after this turn and any change is reported to the lead.`,
+    ]
     : [];
   return [
     `You are the lead ${leadLabel} agent's co-agent. Reply to the lead, not the user.`,
@@ -705,6 +735,7 @@ function buildRules({ personaBody, personaPath, lead, ha, leadHa, access }) {
     ``,
     `Persona (${personaLabel}):`,
     personaBody,
+    ...unenforced,
   ].join('\n');
 }
 
@@ -989,17 +1020,33 @@ async function runTurn(ctx, item) {
     return !!now && !S.isLive(now);
   };
 
+  const blocked = ha.preflight(turnAccess);
+  if (blocked) return { failed: true, error: blocked, code: null };
+
   const bin = H.resolveBin(ha);
   const ping = { pingFile: pingsPath(lead.sessionId), pingFrom: ctx.agentName };
+
+  // Nothing stops an unenforced turn writing, so compare the tree around it.
+  // A change is also pinged: an interrupted turn has no consult to carry it.
+  const watchTree = ha.readOnlyKind(turnAccess) === 'unenforced';
+  const before = watchTree ? C.snapshot(turnCwd) : null;
+  const settle = (result) => {
+    if (!watchTree) return result;
+    const w = C.treeWarning(before, before && C.snapshot(turnCwd));
+    if (!w) return result;
+    if (w.changed) appendPing(ping.pingFile, { from: ctx.agentName, text: w.text });
+    return { ...result, warning: w.text };
+  };
+
   let res = await runCmd(bin, run.args, { onSpawn: stamp(run.sid), cwd: turnCwd, sessionId: run.sid, ha, ping });
-  if (abandoned()) return { interrupted: true };
+  if (abandoned()) return settle({ interrupted: true });
 
   let forkedFrom = null;
   if (res.code !== 0 && existing) {
     const fresh = mkNew(prompt);
     console.error(`coagent: resume of ${meta.sessionId} failed (exit ${res.code}); starting a new tape ${fresh.sid}`);
     const retry = await runCmd(bin, fresh.args, { onSpawn: stamp(fresh.sid), cwd: turnCwd, sessionId: fresh.sid, ha, ping });
-    if (abandoned()) return { interrupted: true };
+    if (abandoned()) return settle({ interrupted: true });
     if (retry.code === 0) {
       run = fresh;
       res = retry;
@@ -1009,9 +1056,10 @@ async function runTurn(ctx, item) {
 
   if (res.code !== 0) {
     const err = (res.err || res.out || '').trim().slice(0, 800);
-    return { failed: true, error: err, code: res.code };
+    return settle({ failed: true, error: err, code: res.code });
   }
 
+  const checked = settle({});
   const parsed = parseResult(res.out);
   if (parsed.sessionId) run.sid = parsed.sessionId;
 
@@ -1029,6 +1077,7 @@ async function runTurn(ctx, item) {
     turns,
     cost,
     forkedFrom && `NEW TAPE (forked from ${forkedFrom})`,
+    checked.warning,
     inner.transcript && `transcript: ${inner.transcript}`,
   ].filter(Boolean).join(' · ');
 
@@ -1072,7 +1121,7 @@ async function runTurn(ctx, item) {
     personaPath: persona.path,
   });
 
-  return { answer: parsed.answer, meta: bits, sessionId: run.sid };
+  return { answer: parsed.answer, meta: bits, sessionId: run.sid, warning: checked.warning };
 }
 
 async function processQueue(ctx) {
@@ -1099,6 +1148,7 @@ async function processQueue(ctx) {
         status: 'failed',
         finishedAt: new Date().toISOString(),
         error: result.error,
+        warning: result.warning || null,
       });
       S.saveMeta(STATE_DIR, key, {
         ...S.loadMeta(STATE_DIR, key),
@@ -1114,6 +1164,7 @@ async function processQueue(ctx) {
       error: null,
       answer: result.answer || null,
       meta: result.meta || null,
+      warning: result.warning || null,
     });
   }
 }
@@ -1207,6 +1258,9 @@ function pinLeadFromItem(cli, itemId) {
 async function cmdSend(message, cli, { later = false } = {}) {
   if (!String(message || '').trim()) fail('usage: coagent "…"  or  coagent later "…"');
   const ctx = resolveContext(cli);
+  // Refuse before anything is queued, so the lead hears now, not on wait.
+  const blocked = ctx.ha.preflight(ctx.access);
+  if (blocked) fail(blocked);
   const key = ctx.key;
   await reap(key);
 
@@ -1239,7 +1293,8 @@ function printSendFooter(ctx, item) {
   const at = ctx.agentName === DEFAULT_AGENT ? '' : `@${ctx.agentName} `;
   if (meta.sessionId) console.log(`  inner: ${meta.sessionId}`);
   if (ctx.cwd && ctx.cwd !== ctx.leadCwd) console.log(`  cwd: ${ctx.cwd}`);
-  if (ctx.access === 'read-only') console.log('  access: read-only');
+  const access = accessLabel(ctx.access, ctx.ha);
+  if (access) console.log(`  access: ${access}`);
   console.log(`  wait: coagent ${at}wait ${item.id}    watch: coagent ${at}watch`);
 }
 
@@ -1394,7 +1449,8 @@ function cmdStatus(cli) {
     : '';
   console.log(`co-agent: @${ctx.agentName}  lead=${ctx.lead.sessionId}  harness=${(ctx.leadHa || ctx.ha).id}${family}  pin=${ctx.lead.pin || '?'}`);
   console.log(`  inner: ${meta.sessionId || '(none — send a message to start one)'}${innerInfo.title ? `  "${innerInfo.title}"` : ''}`);
-  console.log(`  model: ${ctx.model || '(default)'}  effort=${ctx.effort || '?'}${ctx.access === 'read-only' ? '  read-only' : ''}`);
+  const access = accessLabel(ctx.access, ctx.ha);
+  console.log(`  model: ${ctx.model || '(default)'}  effort=${ctx.effort || '?'}${access ? `  ${access}` : ''}`);
   console.log(`  cwd: ${ctx.cwd}`);
   console.log(`  worker: ${workerOn ? `pid=${w && w.pid}` : 'idle'}${w && w.childPid ? ` child=${w.childPid}` : ''}`);
   if (live.length) {
@@ -1463,7 +1519,7 @@ function cmdAgents(cli) {
       a.state,
       harnessId && ctx.leadHa && harnessId !== ctx.leadHa.id ? harnessId : null,
       model,
-      access === 'read-only' ? 'read-only' : null,
+      accessLabel(access, ha),
       a.meta.effort && a.meta.effort !== 'high' ? a.meta.effort : null,
       a.running ? elapsedLabel(a.running.startedAt) : null,
       spend,
@@ -1646,6 +1702,10 @@ function cmdDoctor() {
   console.log(`home:     ${ROOT}`);
   console.log(`persona:  ${fs.existsSync(PERSONA_FILE) ? PERSONA_FILE : 'MISSING'}`);
   console.log(`state:    ${STATE_DIR}`);
+  for (const a of H.ADAPTERS) {
+    const blocked = a.preflight('read-only');
+    if (blocked) console.log(`readonly: ${blocked.split('\n')[0]}`);
+  }
   const r = H.resolve();
   if (r.error) {
     console.log(`harness:  (none) — ${r.error}`);
@@ -1737,6 +1797,7 @@ module.exports = {
   resolveEffort,
   resolveWorkdir,
   resolveAccess,
+  accessLabel,
   resumeDecision,
   buildRules,
   parseResult,

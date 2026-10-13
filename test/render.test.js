@@ -26,6 +26,11 @@ test('formatGrokUpdate pretty-prints user and assistant chunks', () => {
   assert.equal(asst, '● hi');
 });
 
+test('formatConsult shows a turn warning above the answer', () => {
+  const out = R.formatConsult({ id: 'x1', status: 'done', message: 'look', answer: 'fine', warning: '⚠ working tree changed' });
+  assert.deepEqual(out.split('\n').slice(1), ['  > look', '  ⚠ working tree changed', '  ● fine']);
+});
+
 test('formatGrokUpdate skips noise', () => {
   assert.equal(R.formatGrokUpdate({ params: { update: { sessionUpdate: 'hook_execution' } } }), null);
 });

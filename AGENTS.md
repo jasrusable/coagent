@@ -16,6 +16,7 @@ This checkout is the source. Runtime home is `~/.coagent/` (`state/` is not in g
 | `lib/session.js` | Inbox, roster, worker lock |
 | `lib/harness/` | Per-harness adapters (`grok.js`, `claude.js`) + selection (`index.js`) |
 | `lib/render.js` | Watch/log pretty-print |
+| `lib/changes.js` | Git before/after check for `--readonly-unenforced` turns |
 | `test/` | Unit + concurrency tests |
 | `persona.md` | Last-layer rules (seeded if missing) |
 | `skills/coagent/SKILL.md` | Agent skill. Install copies it to `~/.grok/skills/coagent` and links `~/.claude/skills/coagent` there |
@@ -38,6 +39,7 @@ This checkout is the source. Runtime home is `~/.coagent/` (`state/` is not in g
 - `wait` streams the inner tape, then prints consults that finished (`wait <id>` for one turn). `wait <id>` finds that turn when several lead sessions share the checkout and no session id is in the environment. `agents` shows the running turn's model and access, not the previous tape's meta.
 - Inner system prompt every turn: identity + lead transcript paths + labeled `persona.md` (grok `--rules`, claude `--append-system-prompt`). Project AGENTS.md / CLAUDE.md come from the colleague's cwd.
 - `--readonly` sticks on that colleague. Grok runs `--sandbox read-only` and `dontAsk`, without `--always-approve`. Claude runs `dontAsk`, `--permission-prompts none`, no MCP, and its write and subagent tools removed. Bash stays; a command the vendor does not already treat as a read is denied. `--read-write` clears it. Changing access starts a new tape. `coagent reset` clears `@main` only; `coagent @name reset` clears that colleague.
+- Grok's sandbox refuses to start when a socket on its fixed deny list is a symlink out of that list (OrbStack's `/var/run/docker.sock`). Send fails fast on Grok `--readonly` there (`preflight()`); never drop the sandbox silently. `--readonly-unenforced` is the opt-in: Grok with dontAsk, no sandbox, a read-only instruction last in the rules, and a git before/after check (`lib/changes.js`) flagged on the consult and as a ping. Claude treats it as `--readonly`. Shown as `read-only (unenforced)` only where it is unenforced.
 - After changing `bin/` or `lib/`, run `./install.sh` and `npm test`.
 
 ## Commands

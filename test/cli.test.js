@@ -3,7 +3,7 @@
 
 const assert = require('assert');
 const {
-  parseArgs, resolveEffort, resolveWorkdir, resolveAccess, resumeDecision,
+  parseArgs, resolveEffort, resolveWorkdir, resolveAccess, accessLabel, resumeDecision,
   buildRules, parseResult, loadPersona, DEFAULT_WAIT_SEC,
 } = require('../bin/coagent');
 const fs = require('fs');
@@ -91,6 +91,26 @@ test('buildRules tells a read-only colleague the harness refuses writes', () => 
   assert.match(rules, /refuses writes/);
 });
 
+test('buildRules gives an unenforced Grok turn a firm read-only instruction, after the persona', () => {
+  const lead = { sessionId: 'lead-1', transcriptPath: '/tmp/updates.jsonl', contextPath: null };
+  const rules = buildRules({
+    personaBody: 'Be terse.', personaPath: '/tmp/persona.md', ha: grok, leadHa: grok, access: 'read-only-unenforced', lead,
+  });
+  assert.match(rules, /READ-ONLY TURN/);
+  assert.match(rules, /git commit, push/);
+  assert.match(rules, /installs/);
+  assert.match(rules, /network writes/);
+  assert.ok(rules.indexOf('READ-ONLY TURN') > rules.indexOf('Be terse.'));
+  assert.ok(!rules.includes('refuses writes'), 'nothing refuses writes here');
+  const viaClaude = buildRules({
+    personaBody: 'Be terse.', personaPath: '/tmp/persona.md', ha: claude, leadHa: grok, access: 'read-only-unenforced', lead,
+  });
+  assert.match(viaClaude, /refuses writes/);
+  assert.ok(!viaClaude.includes('READ-ONLY TURN'));
+  const full = buildRules({ personaBody: 'x', personaPath: '/tmp/p.md', ha: grok, leadHa: grok, access: 'full', lead });
+  assert.ok(!/read-only/i.test(full));
+});
+
 test('grok runningCost reads usage.json ticks as dollars', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-cost-'));
   fs.writeFileSync(path.join(dir, 'usage.json'), JSON.stringify({
@@ -154,6 +174,87 @@ test('grok args resume vs create', () => {
   const resume = grok.buildArgs({ ...common, sessionId: 'sid', resume: true });
   assert.ok(resume.includes('--resume'));
   assert.ok(!resume.includes('--session-id'));
+});
+
+test('grok unenforced read-only drops only the sandbox', () => {
+  const common = { prompt: 'hello', model: 'grok-4.6', permissionMode: 'bypassPermissions', rules: 'rules', cwd: '/tmp', sessionId: 'sid' };
+  const loose = grok.buildArgs({ ...common, access: 'read-only-unenforced' });
+  assert.ok(!loose.includes('--sandbox'));
+  assert.ok(!loose.includes('--always-approve'));
+  assert.ok(!loose.includes('bypassPermissions'));
+  assert.equal(loose[loose.indexOf('--permission-mode') + 1], 'dontAsk');
+  assert.equal(loose[loose.indexOf('--rules') + 1], 'rules');
+});
+
+test('claude treats --readonly-unenforced exactly as --readonly', () => {
+  const common = { prompt: 'hello', model: 'opus', rules: 'rules', sessionId: 'sid' };
+  assert.deepEqual(
+    claude.buildArgs({ ...common, access: 'read-only-unenforced' }),
+    claude.buildArgs({ ...common, access: 'read-only' }),
+  );
+  assert.equal(claude.preflight('read-only'), null);
+});
+
+function socketFixture() {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-sock-')));
+  const home = path.join(dir, 'home');
+  fs.mkdirSync(path.join(home, '.docker', 'run'), { recursive: true });
+  fs.mkdirSync(path.join(home, '.orbstack', 'run'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.orbstack', 'run', 'docker.sock'), '');
+  fs.writeFileSync(path.join(home, '.docker', 'run', 'docker.sock'), '');
+  return { dir, home };
+}
+
+test('sandboxBlocker flags a listed socket that links outside the list', () => {
+  const { dir, home } = socketFixture();
+  const sock = path.join(dir, 'docker.sock');
+  const endpoints = [sock, '~/.docker/run/docker.sock'];
+  assert.equal(grok.sandboxBlocker({ endpoints, home }), null, 'missing endpoints are fine');
+
+  fs.symlinkSync(path.join(home, '.orbstack', 'run', 'docker.sock'), sock);
+  assert.deepEqual(grok.sandboxBlocker({ endpoints, home }), {
+    endpoint: sock,
+    target: path.join(home, '.orbstack', 'run', 'docker.sock'),
+  });
+
+  fs.unlinkSync(sock);
+  fs.symlinkSync(path.join(home, '.docker', 'run', 'docker.sock'), sock);
+  assert.equal(grok.sandboxBlocker({ endpoints, home }), null, 'a link to another listed socket is fine');
+
+  fs.unlinkSync(sock);
+  fs.symlinkSync(path.join(dir, 'gone.sock'), sock);
+  assert.equal(grok.sandboxBlocker({ endpoints, home }).target, path.join(dir, 'gone.sock'), 'dangling still counts');
+
+  fs.unlinkSync(sock);
+  fs.writeFileSync(sock, '');
+  assert.equal(grok.sandboxBlocker({ endpoints, home }), null, 'a real socket file is fine');
+
+  const tilde = path.join(home, '.docker', 'desktop');
+  fs.mkdirSync(tilde, { recursive: true });
+  fs.symlinkSync(path.join(home, '.orbstack', 'run', 'docker.sock'), path.join(tilde, 'docker.sock'));
+  assert.equal(
+    grok.sandboxBlocker({ endpoints: ['~/.docker/desktop/docker.sock'], home }).endpoint,
+    path.join(tilde, 'docker.sock'),
+    '~ expands to the given home',
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('grok preflight refuses enforced read-only when the sandbox cannot start', () => {
+  const { dir, home } = socketFixture();
+  const sock = path.join(dir, 'docker.sock');
+  fs.symlinkSync(path.join(home, '.orbstack', 'run', 'docker.sock'), sock);
+  const opts = { endpoints: [sock], home };
+  const msg = grok.preflight('read-only', opts);
+  assert.ok(msg.includes(sock), msg);
+  assert.ok(msg.includes('.orbstack/run/docker.sock'), msg);
+  assert.match(msg, /will not drop the sandbox silently/);
+  assert.match(msg, /--model opus --readonly/);
+  assert.match(msg, /--readonly-unenforced/);
+  assert.equal(grok.preflight('read-only-unenforced', opts), null);
+  assert.equal(grok.preflight('full', opts), null);
+  assert.equal(grok.preflight('read-only', { endpoints: [path.join(dir, 'none.sock')], home }), null);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test('claude args map rules to --append-system-prompt and skip grok-only flags', () => {
@@ -276,7 +377,15 @@ test('parseArgs reads --cwd and read-only', () => {
   assert.equal(parseArgs(['--read-only']).access, 'read-only');
   assert.equal(parseArgs(['--read-write']).access, 'full');
   assert.throws(() => parseArgs(['--cwd']), /directory/);
-  assert.throws(() => parseArgs(['--readonly', '--read-write']), /not both/);
+  assert.throws(() => parseArgs(['--readonly', '--read-write']), /one of/);
+});
+
+test('parseArgs reads --readonly-unenforced and refuses a second access mode', () => {
+  assert.equal(parseArgs(['--readonly-unenforced', 'look']).access, 'read-only-unenforced');
+  assert.equal(parseArgs(['--read-only-unenforced']).access, 'read-only-unenforced');
+  assert.equal(parseArgs(['--readonly-unenforced', '--readonly-unenforced']).access, 'read-only-unenforced');
+  assert.throws(() => parseArgs(['--readonly', '--readonly-unenforced']), /one of/);
+  assert.throws(() => parseArgs(['--readonly-unenforced', '--read-write']), /one of/);
 });
 
 test('resolveWorkdir requires a real directory and keeps the path given', () => {
@@ -293,6 +402,17 @@ test('resolveAccess prefers the flag, then env, then the stored colleague', () =
   assert.equal(resolveAccess({ asked: null, env: 'full', stored: 'read-only' }), 'full');
   assert.equal(resolveAccess({ asked: null, env: '', stored: 'read-only' }), 'read-only');
   assert.equal(resolveAccess({ asked: null, env: null, stored: null }), 'full');
+  assert.equal(resolveAccess({ asked: null, env: '', stored: 'read-only-unenforced' }), 'read-only-unenforced');
+  assert.equal(resolveAccess({ asked: 'read-only-unenforced', env: 'full', stored: 'read-only' }), 'read-only-unenforced');
+  assert.equal(resolveAccess({ asked: null, env: 'bogus', stored: null }), 'full');
+});
+
+test('accessLabel says unenforced only where the harness cannot enforce it', () => {
+  assert.equal(accessLabel('read-only-unenforced', grok), 'read-only (unenforced)');
+  assert.equal(accessLabel('read-only', grok), 'read-only');
+  assert.equal(accessLabel('read-only-unenforced', claude), 'read-only');
+  assert.equal(accessLabel('full', grok), null);
+  assert.equal(accessLabel(null, claude), null);
 });
 
 test('resumeDecision starts a new tape when family, directory, or access changes', () => {
@@ -308,6 +428,9 @@ test('resumeDecision starts a new tape when family, directory, or access changes
   const access = resumeDecision({ meta, harnessId: 'grok', cwd: '/tmp/a', access: 'read-only' });
   assert.equal(access.resume, false);
   assert.match(access.reason, /read-only/);
+  const loose = resumeDecision({ meta: { ...meta, access: 'read-only' }, harnessId: 'grok', cwd: '/tmp/a', access: 'read-only-unenforced' });
+  assert.equal(loose.resume, false);
+  assert.match(loose.reason, /read-only → read-only-unenforced/);
 });
 
 test('parseArgs reads --effort', () => {

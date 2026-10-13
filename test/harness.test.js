@@ -483,12 +483,13 @@ function writeLead(home, sid, infoCwd) {
   return grokHome;
 }
 
-function writeFakeGrok(binDir, { argLog, pwdLog, delayMs = 0, toolDelayMs = 0 }) {
+function writeFakeGrok(binDir, { argLog, pwdLog, delayMs = 0, toolDelayMs = 0, touch = null }) {
   const script = `#!/usr/bin/env node
 const fs = require('fs');
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(argLog)}, args.join('\\n') + '\\n---\\n');
 ${pwdLog ? `fs.appendFileSync(${JSON.stringify(pwdLog)}, process.cwd() + '\\n');` : ''}
+${touch ? `fs.writeFileSync(${JSON.stringify(touch)}, String(Date.now()));` : ''}
 let sid = null, cwd = null;
 for (let i = 0; i < args.length; i++) {
   if ((args[i] === '--session-id' || args[i] === '--resume') && args[i + 1]) sid = args[i + 1];
@@ -526,6 +527,8 @@ function leadEnv(home, grokHome, binDir, sid) {
     COAGENT_MODEL: '',
     COAGENT_EFFORT: '',
     COAGENT_AGENT: '',
+    // This machine's /var/run must not decide whether grok's sandbox starts.
+    COAGENT_GROK_SOCKETS: path.join(home, 'no-such.sock'),
   };
 }
 
@@ -644,6 +647,88 @@ test('--readonly sticks and --read-write clears it', async () => {
   assert.ok(!block.includes('--resume'), block);
 
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('grok --readonly fails fast when its sandbox cannot start', async () => {
+  const home = tmp();
+  const sid = 'cccccccc-2222-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const binDir = path.join(home, 'fakebin');
+  const argLog = path.join(home, 'args.txt');
+  writeFakeGrok(binDir, { argLog });
+  const orb = path.join(home, 'orbstack.sock');
+  const sock = path.join(home, 'docker.sock');
+  fs.writeFileSync(orb, '');
+  fs.symlinkSync(orb, sock);
+  const env = { ...leadEnv(home, grokHome, binDir, sid), COAGENT_GROK_SOCKETS: sock };
+
+  const sent = await runCoagent(['--readonly', 'look'], env);
+  assert.notEqual(sent.code, 0);
+  assert.ok(sent.err.includes(sock), sent.err);
+  assert.match(sent.err, /--model opus --readonly/);
+  assert.match(sent.err, /--readonly-unenforced/);
+  assert.ok(!fs.existsSync(argLog), 'grok must not be started');
+  const inbox = path.join(home, 'state', sid, 'agents', 'main', 'inbox.json');
+  const items = fs.existsSync(inbox) ? JSON.parse(fs.readFileSync(inbox, 'utf8')) : [];
+  assert.equal((Array.isArray(items) ? items : items.items || []).length, 0, 'nothing is queued');
+
+  const loose = await runCoagent(['--readonly-unenforced', 'look'], env);
+  assert.equal(loose.code, 0, loose.err || loose.out);
+  assert.match(loose.out, /access: read-only \(unenforced\)/);
+  assert.equal((await runCoagent(['wait', '--timeout', '15'], env)).code, 0);
+  assert.ok(fs.existsSync(argLog));
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('--readonly-unenforced runs grok without the sandbox and flags tree changes', async () => {
+  const home = tmp();
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-repo-')));
+  const g = (...a) => spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...a], { cwd: repo });
+  g('init', '-q');
+  fs.writeFileSync(path.join(repo, 'a.js'), 'a\n');
+  g('add', '.');
+  g('commit', '-q', '-m', 'init');
+  const sid = 'dddddddd-2222-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const binDir = path.join(home, 'fakebin');
+  const argLog = path.join(home, 'args.txt');
+  writeFakeGrok(binDir, { argLog, touch: path.join(repo, 'written.txt') });
+  const env = leadEnv(home, grokHome, binDir, sid);
+  const last = () => fs.readFileSync(argLog, 'utf8').trim().split('---').filter(Boolean).pop();
+
+  const sent = await runCoagent(['@loose', '--cwd', repo, '--readonly-unenforced', 'look'], env);
+  assert.equal(sent.code, 0, sent.err || sent.out);
+  const waited = await runCoagent(['@loose', 'wait', '--timeout', '15'], env);
+  assert.equal(waited.code, 0, waited.err || waited.out);
+  let block = last();
+  assert.ok(!block.includes('--sandbox'), block);
+  assert.ok(!block.includes('--always-approve'), block);
+  assert.match(block, /--permission-mode\ndontAsk/);
+  assert.match(block, /READ-ONLY TURN/);
+  assert.match(waited.out, /⚠ working tree changed during a read-only \(unenforced\) turn: written\.txt/);
+  const pings = fs.readFileSync(path.join(home, 'state', sid, 'pings.jsonl'), 'utf8');
+  assert.match(pings, /"from":"loose".*written\.txt/);
+
+  const listed = await runCoagent(['agents'], env);
+  assert.match(listed.out, /@loose\s+idle\s+grok-4\.6\s+read-only \(unenforced\)/);
+
+  fs.writeFileSync(argLog, '');
+  assert.equal((await runCoagent(['@loose', 'again'], env)).code, 0);
+  assert.equal((await runCoagent(['@loose', 'wait', '--timeout', '15'], env)).code, 0);
+  block = last();
+  assert.match(block, /--resume/);
+  assert.ok(!block.includes('--sandbox'), block);
+
+  fs.writeFileSync(argLog, '');
+  assert.equal((await runCoagent(['@loose', '--readonly', 'strict'], env)).code, 0);
+  assert.equal((await runCoagent(['@loose', 'wait', '--timeout', '15'], env)).code, 0);
+  block = last();
+  assert.match(block, /--sandbox\nread-only/);
+  assert.ok(!block.includes('--resume'), 'changing access starts a new tape');
+
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(repo, { recursive: true, force: true });
 });
 
 test('agents shows the running turn, not the previous tape', async () => {

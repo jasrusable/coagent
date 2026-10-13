@@ -106,6 +106,17 @@ always-approve. Claude runs dontAsk, with write tools and MCP removed, and
 a prompt is denied instead of asked. `--read-write` clears it. A change
 starts a new tape. A sentence in the brief does not.
 
+Grok's sandbox cannot start when a runtime socket on its fixed deny list
+is a symlink out of that list (OrbStack: `/var/run/docker.sock` →
+`~/.orbstack/run/docker.sock`). A Grok `--readonly` send then fails at
+once rather than run without it. Pick one:
+
+- `--model opus --readonly` — enforced, via Claude. Prefer this.
+- `--readonly-unenforced` — Grok, no sandbox, told not to write. NOT
+  enforced. In a git tree, any change during the turn is flagged on the
+  consult and as a ping (yours count too, in a shared checkout). On
+  Claude models it equals `--readonly`. Sticky.
+
 ## Models
 
 `--model` on a send may pick the other family: `fable` / `opus` /
