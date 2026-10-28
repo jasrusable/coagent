@@ -89,6 +89,20 @@ test('buildRules tells a read-only colleague the harness refuses writes', () => 
   });
   assert.match(rules, /Read-only/);
   assert.match(rules, /refuses writes/);
+  assert.match(rules, /read-only commands are available/);
+});
+
+test('buildRules tells a read-only Claude colleague it has no shell', () => {
+  const rules = buildRules({
+    personaBody: 'Be terse.',
+    personaPath: '/tmp/persona.md',
+    ha: claude,
+    leadHa: claude,
+    access: 'read-only',
+    lead: { sessionId: 'lead-1', transcriptPath: '/tmp/x.jsonl', contextPath: null },
+  });
+  assert.match(rules, /no shell/);
+  assert.match(rules, /Ask the lead/);
 });
 
 test('buildRules gives an unenforced Grok turn a firm read-only instruction, after the persona', () => {
@@ -281,6 +295,7 @@ test('claude args map rules to --append-system-prompt and skip grok-only flags',
   assert.ok(locked.includes('--strict-mcp-config'));
   assert.match(locked[locked.indexOf('--disallowed-tools') + 1], /Edit/);
   assert.match(locked[locked.indexOf('--disallowed-tools') + 1], /Write/);
+  assert.match(locked[locked.indexOf('--disallowed-tools') + 1], /\bBash\b/);
   assert.ok(!locked.includes('--always-approve'));
   assert.ok(!locked.includes('bypassPermissions'));
   const resume = claude.buildArgs({ ...common, sessionId: 'sid', resume: true });

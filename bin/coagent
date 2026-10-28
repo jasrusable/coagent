@@ -132,8 +132,9 @@ Options:
   \`coagent reset\` clears @main. \`coagent @name reset\` clears that colleague.
   \`coagent @name remove\` frees its slot (cap ${MAX_AGENTS}); do it when its job is done.
   The default bypasses approvals. \`--readonly\` does not: Grok gets the
-  read-only sandbox and dontAsk; Claude gets dontAsk, write tools and MCP
-  removed, and a prompt is denied instead of asked.
+  read-only sandbox and dontAsk; Claude gets dontAsk, write tools, Bash and
+  MCP removed, and a prompt is denied instead of asked. A Claude reviewer
+  has no shell, so give it the diff and test output in the brief.
 
   Grok's sandbox will not start when a socket on its fixed deny list is a
   symlink out of that list (OrbStack: /var/run/docker.sock →
@@ -712,7 +713,7 @@ function buildRules({ personaBody, personaPath, lead, ha, leadHa, access }) {
     : [];
   const readOnlyKind = ha.readOnlyKind(access);
   const readOnly = readOnlyKind === 'enforced'
-    ? ['Read-only: the harness refuses writes. Read, search, and read-only commands are available.']
+    ? [`Read-only: the harness refuses writes. ${ha.readOnlyTools || 'Read, search, and read-only commands are available.'}`]
     : [];
   // Last, after the persona, so nothing in it reads as permission to write.
   const unenforced = readOnlyKind === 'unenforced'
