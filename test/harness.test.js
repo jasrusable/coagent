@@ -614,6 +614,137 @@ test('reset @name starts a new tape and bare reset does not', async () => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test('a colleague whose directory was removed keeps wait and log, and a send names the fix', async () => {
+  const home = tmp();
+  const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-gone-'));
+  const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-next-'));
+  const sid = 'cccccccc-1111-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const binDir = path.join(home, 'fakebin');
+  const argLog = path.join(home, 'args.txt');
+  writeFakeGrok(binDir, { argLog });
+  const env = leadEnv(home, grokHome, binDir, sid);
+
+  assert.equal((await runCoagent(['@fable', '--cwd', dirA, 'first job'], env)).code, 0);
+  assert.equal((await runCoagent(['@fable', 'wait', '--timeout', '15'], env)).code, 0);
+  fs.rmSync(dirA, { recursive: true, force: true });
+
+  const log = await runCoagent(['@fable', 'log'], env);
+  assert.equal(log.code, 0, log.err || log.out);
+  assert.match(log.out, /first job/);
+
+  const bare = await runCoagent(['@fable', 'again'], env);
+  assert.notEqual(bare.code, 0);
+  assert.match(bare.err, /no longer exists — pass --cwd <dir>, or free it with `coagent @fable remove`/);
+  const reset = await runCoagent(['@fable', 'reset'], env);
+  assert.equal(reset.code, 0, reset.err || reset.out);
+  assert.match((await runCoagent(['@fable', 'again'], env)).err, /no longer exists/, 'reset does not move it to the lead checkout');
+
+  writeFakeGrok(binDir, { argLog, delayMs: 1500 });
+  const sent = await runCoagent(['@fable', '--cwd', dirB, 'second job'], env);
+  assert.equal(sent.code, 0, sent.err || sent.out);
+  const id = sent.out.match(/(?:sent|send-now)\s+(\S+)/)[1];
+  // The turn is still running, so meta still names the removed directory.
+  const waited = await runCoagent(['@fable', 'wait', id, '--timeout', '15'], env);
+  assert.equal(waited.code, 0, waited.err || waited.out);
+  assert.match(waited.out, /second job/);
+
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(dirB, { recursive: true, force: true });
+});
+
+test('bare wait <id> finds the colleague that owns it', async () => {
+  const home = tmp();
+  const sid = 'dddddddd-1111-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const binDir = path.join(home, 'fakebin');
+  writeFakeGrok(binDir, { argLog: path.join(home, 'args.txt') });
+  const env = leadEnv(home, grokHome, binDir, sid);
+
+  const sent = await runCoagent(['@fable', 'look'], env);
+  assert.equal(sent.code, 0, sent.err || sent.out);
+  const id = sent.out.match(/(?:sent|send-now)\s+(\S+)/)[1];
+  const waited = await runCoagent(['wait', id, '--timeout', '15'], env);
+  assert.equal(waited.code, 0, waited.err || waited.out);
+  assert.match(waited.out, /look/);
+  const missing = await runCoagent(['wait', 'nope1234', '--timeout', '2'], env);
+  assert.match(missing.err, /unknown item nope1234/);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('remove frees a slot; it refuses a busy, unknown or unnamed colleague', async () => {
+  const home = tmp();
+  const sid = 'eeeeeeee-1111-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const binDir = path.join(home, 'fakebin');
+  writeFakeGrok(binDir, { argLog: path.join(home, 'args.txt') });
+  const env = leadEnv(home, grokHome, binDir, sid);
+  const state = path.join(home, 'state');
+  const S = require('../lib/session.js');
+  const names = ['a1', 'a2', 'a3', 'a4', 'a5', 'a6'];
+  for (const n of names) {
+    const key = path.join(sid, 'agents', n);
+    S.ensureLead(state, key);
+    S.saveMeta(state, key, { ...S.loadMeta(state, key), sessionId: `tape-${n}`, cwd: process.cwd() });
+  }
+  const ask = path.join(state, sid, 'asks');
+  fs.mkdirSync(ask, { recursive: true });
+  fs.writeFileSync(path.join(ask, 'q1.json'), JSON.stringify({ id: 'q1', from: 'a1', text: 'which?' }));
+
+  const full = await runCoagent(['@a7', 'hello'], env);
+  assert.notEqual(full.code, 0);
+  assert.match(full.err, /max 6\. Free one with `coagent @name remove`/);
+
+  assert.match((await runCoagent(['remove'], env)).err, /usage: coagent @name remove/);
+  assert.match((await runCoagent(['@nobody', 'remove'], env)).err, /no colleague @nobody/);
+
+  const busyKey = path.join(sid, 'agents', 'a2');
+  const item = S.enqueue(state, busyKey, 'busy job');
+  S.updateItem(state, busyKey, item.id, { status: 'running', startedAt: new Date().toISOString() });
+  S.tryLock(state, busyKey, process.pid);
+  const busy = await runCoagent(['@a2', 'remove'], env);
+  assert.notEqual(busy.code, 0);
+  assert.match(busy.err, /@a2 is busy — stop it first/);
+  assert.ok(fs.existsSync(path.join(state, busyKey)));
+  S.releaseLock(state, busyKey, process.pid);
+
+  const removed = await runCoagent(['remove', '@a1'], env);
+  assert.equal(removed.code, 0, removed.err || removed.out);
+  assert.match(removed.out, /removed @a1; its slot is free/);
+  assert.match(removed.out, /tape-a1/);
+  assert.ok(!fs.existsSync(path.join(state, sid, 'agents', 'a1')));
+  assert.ok(!fs.existsSync(path.join(ask, 'q1.json')), 'its open asks go with it');
+  assert.ok(fs.existsSync(path.join(state, sid, 'agents', 'a3')), 'others stay');
+
+  const next = await runCoagent(['@a7', 'hello'], env);
+  assert.equal(next.code, 0, next.err || next.out);
+  assert.equal((await runCoagent(['@a7', 'wait', '--timeout', '15'], env)).code, 0);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('an idle colleague whose directory is gone does not hold a slot', async () => {
+  const home = tmp();
+  const sid = 'ffffffff-1111-2222-3333-444444444444';
+  const grokHome = writeLead(home, sid);
+  const binDir = path.join(home, 'fakebin');
+  writeFakeGrok(binDir, { argLog: path.join(home, 'args.txt') });
+  const env = leadEnv(home, grokHome, binDir, sid);
+  const state = path.join(home, 'state');
+  const S = require('../lib/session.js');
+  for (const n of ['b1', 'b2', 'b3', 'b4', 'b5', 'b6']) {
+    const key = path.join(sid, 'agents', n);
+    S.ensureLead(state, key);
+    const cwd = n === 'b1' ? path.join(home, 'removed-worktree') : process.cwd();
+    S.saveMeta(state, key, { ...S.loadMeta(state, key), cwd });
+  }
+  const sent = await runCoagent(['@b7', 'hello'], env);
+  assert.equal(sent.code, 0, sent.err || sent.out);
+  assert.equal((await runCoagent(['@b7', 'wait', '--timeout', '15'], env)).code, 0);
+  const listed = await runCoagent(['agents'], env);
+  assert.match(listed.out, /@b1/, 'still listed until removed');
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test('--readonly sticks and --read-write clears it', async () => {
   const home = tmp();
   const sid = 'aaaaaaaa-2222-2222-3333-444444444444';

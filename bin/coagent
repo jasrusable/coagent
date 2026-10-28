@@ -18,7 +18,7 @@ const PERSONA_FILE = path.join(ROOT, 'persona.md');
 const STATE_DIR = path.join(ROOT, 'state');
 const DEFAULT_WAIT_SEC = 600;
 const VERBS = new Set([
-  'later', 'stop', 'wait', 'watch', 'log', 'reset', 'sessions', 'resume',
+  'later', 'stop', 'wait', 'watch', 'log', 'reset', 'remove', 'sessions', 'resume',
   'status', 'now', 'doctor', 'help', 'agents', 'notify', 'pings',
   'ask', 'answer', 'asks',
 ]);
@@ -91,6 +91,7 @@ Usage:
   coagent watch [-f]             live tail of the inner transcript
   coagent reset                  new tape for @main (named colleagues keep theirs)
   coagent @name reset            new tape for that colleague (old tape stays on disk)
+  coagent @name remove           drop that colleague and free its slot (tapes stay on disk)
   coagent sessions               inner sessions for this lead
   coagent resume <id>            make an old inner session current
 
@@ -129,6 +130,7 @@ Options:
   Send is background. Ctrl-C on wait/watch does not stop the inner agent.
   Busy send = steer (interrupt). Use \`later\` to queue.
   \`coagent reset\` clears @main. \`coagent @name reset\` clears that colleague.
+  \`coagent @name remove\` frees its slot (cap ${MAX_AGENTS}); do it when its job is done.
   The default bypasses approvals. \`--readonly\` does not: Grok gets the
   read-only sandbox and dontAsk; Claude gets dontAsk, write tools and MCP
   removed, and a prompt is denied instead of asked.
@@ -782,7 +784,18 @@ function parseResult(out) {
   return { answer, sessionId, durMs, costUsd, numTurns, isError, stopReason };
 }
 
-function resolveContext(cli, { create = true } = {}) {
+// An idle colleague whose directory is gone (a removed worktree) cannot be
+// resumed without a new --cwd, so it does not hold one of the slots.
+function holdsSlot(leadSessionId, name) {
+  const key = agentKey(leadSessionId, name);
+  const { cwd } = S.loadMeta(STATE_DIR, key);
+  return !cwd || fs.existsSync(cwd) || S.busy(STATE_DIR, key);
+}
+
+// `send` is a turn about to run in the stored directory, so a gone one must
+// fail. Every other verb only reads or rewrites state, and must keep working
+// after the colleague's worktree is removed.
+function resolveContext(cli, { create = true, send = false } = {}) {
   const persona = loadPersona(PERSONA_FILE);
   const leadHa = adapter();
   const lead = resolveLead();
@@ -791,8 +804,9 @@ function resolveContext(cli, { create = true } = {}) {
   const key = agentKey(lead.sessionId, agentName);
   if (create) {
     const known = listAgentNames(lead.sessionId);
-    if (!known.includes(agentName) && known.length >= MAX_AGENTS) {
-      fail(`already running ${known.length} colleagues (${known.join(', ')}) — max ${MAX_AGENTS}. Reset or reuse one.`);
+    const held = known.filter((n) => holdsSlot(lead.sessionId, n));
+    if (!known.includes(agentName) && held.length >= MAX_AGENTS) {
+      fail(`already running ${held.length} colleagues (${held.join(', ')}) — max ${MAX_AGENTS}. Free one with \`coagent @name remove\`, or reuse one.`);
     }
     S.ensureLead(STATE_DIR, key);
   }
@@ -838,7 +852,14 @@ function resolveContext(cli, { create = true } = {}) {
   // colleague's stored directory, win over it. The worker is a new process
   // and only sees what workerEnv put in COAGENT_CWD.
   const leadCwd = leadModel.cwd || process.cwd();
-  const cwd = resolveWorkdir(cli.cwd || process.env.COAGENT_CWD || meta.cwd || leadCwd);
+  const askedCwd = cli.cwd || process.env.COAGENT_CWD || null;
+  const storedGone = !!meta.cwd && !fs.existsSync(meta.cwd);
+  if (send && !askedCwd && storedGone) {
+    const who = agentName === DEFAULT_AGENT ? 'this colleague' : `@${agentName}`;
+    fail(`${who}'s directory ${meta.cwd} no longer exists — pass --cwd <dir>, or free it with \`coagent @${agentName} remove\``);
+  }
+  const stored = storedGone ? null : meta.cwd;
+  const cwd = resolveWorkdir(askedCwd || stored || leadCwd);
   const access = resolveAccess({
     asked: cli.access,
     env: process.env.COAGENT_ACCESS,
@@ -860,6 +881,7 @@ function resolveContext(cli, { create = true } = {}) {
     effort,
     leadCwd,
     cwd,
+    staleCwd: storedGone && !askedCwd ? meta.cwd : null,
     access,
     agent,
     permissionMode: persona.permissionMode,
@@ -1257,7 +1279,7 @@ function pinLeadFromItem(cli, itemId) {
 
 async function cmdSend(message, cli, { later = false } = {}) {
   if (!String(message || '').trim()) fail('usage: coagent "…"  or  coagent later "…"');
-  const ctx = resolveContext(cli);
+  const ctx = resolveContext(cli, { send: true });
   // Refuse before anything is queued, so the lead hears now, not on wait.
   const blocked = ctx.ha.preflight(ctx.access);
   if (blocked) fail(blocked);
@@ -1367,7 +1389,16 @@ function itemSettled(it) {
   return it && (it.status === 'done' || it.status === 'failed' || it.status === 'interrupted');
 }
 
+// The send footer prints `@name wait <id>`, but a bare `wait <id>` should not
+// say "unknown item" when the id is plainly one of this lead's colleagues'.
+function colleagueOwning(leadSessionId, itemId) {
+  const owners = listAgentNames(leadSessionId)
+    .filter((n) => S.findItem(STATE_DIR, agentKey(leadSessionId, n), itemId));
+  return owners.length === 1 ? owners[0] : null;
+}
+
 async function cmdWait(cli, itemId) {
+  if (itemId && !cli.agentName) cli.agentName = colleagueOwning(resolveLead().sessionId, itemId);
   const ctx = resolveContext(cli, { create: false });
   const key = ctx.key;
   const timeoutSec = cli.timeoutSec != null ? cli.timeoutSec : DEFAULT_WAIT_SEC;
@@ -1651,7 +1682,9 @@ function cmdReset(cli) {
   S.saveMeta(STATE_DIR, key, {
     ...S.emptyMeta(),
     harness: ctx.ha.id,
-    cwd: ctx.cwd,
+    // A gone directory stays stored, so the next send asks for a new --cwd
+    // instead of quietly running in the lead's checkout.
+    cwd: ctx.staleCwd || ctx.cwd,
     access: ctx.access,
     model: ctx.model,
     effort: ctx.effort,
@@ -1664,6 +1697,22 @@ function cmdReset(cli) {
   }
   console.log(`co-agent: reset ${who} archived ${old}`);
   console.log(`  old tape kept. resume it with: coagent ${who}resume ${old}`);
+}
+
+function cmdRemove(cli) {
+  const name = cli.agentName;
+  if (!name) fail('usage: coagent @name remove');
+  const lead = resolveLead();
+  migrateFlatState(lead.sessionId);
+  if (!listAgentNames(lead.sessionId).includes(name)) fail(`no colleague @${name}`);
+  const key = agentKey(lead.sessionId, name);
+  S.reapStale(STATE_DIR, key);
+  if (S.busy(STATE_DIR, key)) fail(`@${name} is busy — stop it first (coagent @${name} stop), then remove`);
+  const { sessionId } = S.loadMeta(STATE_DIR, key);
+  clearAsksFrom(lead.sessionId, name);
+  fs.rmSync(path.join(STATE_DIR, key), { recursive: true, force: true });
+  console.log(`co-agent: removed @${name}; its slot is free`);
+  if (sessionId) console.log(`  its tapes stay on disk (last: ${sessionId})`);
 }
 
 function cmdLog(cli) {
@@ -1747,7 +1796,7 @@ async function main() {
   };
 
   if (parsed.worker || process.env.COAGENT_BG_WORKER === '1') {
-    const ctx = resolveContext(cli);
+    const ctx = resolveContext(cli, { send: true });
     await becomeWorkerAndDrain(ctx);
     return;
   }
@@ -1778,6 +1827,7 @@ async function main() {
   if (verb === 'watch') return await cmdWatch(cli);
   if (verb === 'log') return cmdLog(cli);
   if (verb === 'reset') return cmdReset(cli);
+  if (verb === 'remove') return cmdRemove(cli);
   if (verb === 'sessions') return cmdSessions(cli);
   if (verb === 'resume') return cmdResume(cli, rest[1]);
   if (verb === 'doctor') return cmdDoctor();
