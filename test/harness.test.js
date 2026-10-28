@@ -745,7 +745,7 @@ test('an idle colleague whose directory is gone does not hold a slot', async () 
   assert.match(listed.out, /@b1/, 'still listed until removed');
   const status = await runCoagent(['@b1'], env);
   assert.match(status.out, /cwd: .*removed-worktree \(gone — the next send needs --cwd\)/);
-  // Seven now hold slots; reviving the gone one must not make it eight.
+  // b2–b7 hold the six slots; reviving b1 must not make it seven.
   const revive = await runCoagent(['@b1', '--cwd', process.cwd(), 'back'], env);
   assert.notEqual(revive.code, 0);
   assert.match(revive.err, /max 6/);
