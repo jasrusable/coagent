@@ -6,7 +6,8 @@ description: >
   continues until you reset it, so a later message is a follow-up to
   that same agent. You send a task. The command returns immediately,
   with an id, before the work is finished. It writes its answer back
-  to you, not to the user. You can have up to six. Each can use a
+  to you, not to the user. You can have up to six; remove one when
+  its job is done to free the slot. Each can use a
   different model from you: fable and opus run as Claude, grok-* runs
   as Grok. Unless you pass --readonly, it may edit the repo and it
   skips approval prompts.
@@ -95,11 +96,18 @@ conclusions are stale.
 
 `@main` is the default thinking partner and follows your model and effort.
 `coagent @name "…"` starts or continues a named colleague — own tape,
-inbox, and lock. Cap is 6; reuse or reset rather than minting another.
+inbox, and lock. Cap is 6 per lead session, and your sub-agents share
+it. **When a colleague's job is done, free it:
+`coagent @name remove`.** Reset keeps the slot; remove gives it back. Remove
+is refused while the colleague is busy (`stop` it first). Its transcripts
+stay on disk, but `sessions` no longer lists them. Remove only colleagues
+you started. An idle colleague whose `--cwd`
+is gone does not count toward the cap.
 
 `--cwd <dir>` is that colleague's working tree. It sticks. A different
 directory starts a new tape. With none set, the colleague uses the lead's
-checkout.
+checkout. If the stored directory is removed, `wait`, `log` and `agents`
+keep working; the next send needs a new `--cwd`.
 
 `--readonly` sticks. Grok runs in the read-only sandbox, without
 always-approve. Claude runs dontAsk, with write tools and MCP removed, and

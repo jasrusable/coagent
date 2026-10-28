@@ -15,7 +15,7 @@ A lead that does every long job in its own session spends that session's context
 - **You keep the lead.** Send returns immediately. The lead goes on talking, editing, and answering you while the colleague works. The next send steers a busy colleague; `later` queues behind the current turn.
 - **The colleague remembers.** Its tape lasts until `reset`. A second pass, or "look again now that this is fixed", continues that session.
 - **Other model, same tree.** A Grok lead can hand a review to Fable or Opus. A Claude lead can hand one to Grok. Switching family starts that colleague a new tape.
-- **A few at once.** Named colleagues (`@review`, `@opus`, …) each have a tape, an inbox, and a lock, up to 6. You still only talk to the lead.
+- **A few at once.** Named colleagues (`@review`, `@opus`, …) each have a tape, an inbox, and a lock, up to 6. `coagent @name remove` frees a slot when that colleague's job is done. You still only talk to the lead.
 - **Fan-out can be the cheap model.** `@main` follows the lead. Named colleagues can default to a smaller model and a lower effort. One turn can still override with `--model` and `--effort`.
 - **The long transcript stays over there.** The lead gets the reply. The search, the files read, and the dead ends stay on the colleague's tape.
 
@@ -54,6 +54,7 @@ coagent log                    # consults (your messages + inner replies)
 coagent watch                  # live tail of inner updates.jsonl
 coagent reset                  # new tape for @main; named colleagues keep theirs
 coagent @name reset            # new tape for that colleague
+coagent @name remove           # drop that colleague, free its slot
 coagent sessions               # list inner sessions for this lead
 coagent resume <id>            # make an old inner session current
 ```
@@ -88,7 +89,10 @@ coagent @review "…"                  # address a named colleague (starts one)
 coagent @review "new focus…"         # busy colleague is interrupted (steer)
 coagent agents                       # who exists, doing what, elapsed, spend
 coagent wait --all                   # wait for all; print as each lands
+coagent @review remove               # job done: free the slot
 ```
+
+The cap is 6 per lead session. `reset` gives a colleague a new tape but keeps its slot; `remove` drops it (refused while it is busy; its transcripts stay on disk, but `sessions` no longer lists them). An idle colleague whose `--cwd` no longer exists (a removed worktree) does not count toward the cap, and `wait`, `log` and `agents` still work on it; a send to it needs a new `--cwd`.
 
 ### Briefs
 
