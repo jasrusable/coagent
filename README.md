@@ -69,7 +69,7 @@ By default it bypasses approvals. `--readonly` does not: the colleague can read,
 
 Grok's read-only sandbox has a fixed, unconfigurable deny list of container-runtime sockets, and refuses to start when one of them is a symlink to a path outside that list. OrbStack makes `/var/run/docker.sock` such a symlink (→ `~/.orbstack/run/docker.sock`). There, a Grok `--readonly` send fails at once, naming the link; coagent does not drop the sandbox silently. Two ways out:
 
-- `--model opus --readonly` — enforced read-only, via Claude.
+- `--model opus --readonly` — enforced read-only, via Claude. It has no shell (your allow rules could let Bash write), so put the diff and test output in the brief.
 - `--readonly-unenforced` — Grok without the sandbox, in dontAsk, told firmly not to write. **Not enforced**: in testing, dontAsk did not stop grok's writes. In a git work tree coagent compares the tree before and after each turn and flags any change on the consult and as a ping (`⚠ working tree changed during a read-only (unenforced) turn: …`). It cannot tell who made the change, it ignores gitignored files, and it cannot see network writes; outside git it says the tree was not checked. On Claude models it is the same as `--readonly`. Sticky, like `--readonly`.
 
 `coagent doctor` says when grok's sandbox cannot start. `--cwd <dir>` is the colleague's directory and sticks the same way. A change of directory or access starts a new tape. Reset between unrelated jobs so the tape doesn't rot.
