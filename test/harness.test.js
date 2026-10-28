@@ -711,7 +711,8 @@ test('remove frees a slot; it refuses a busy, unknown or unnamed colleague', asy
   const removed = await runCoagent(['remove', '@a1'], env);
   assert.equal(removed.code, 0, removed.err || removed.out);
   assert.match(removed.out, /removed @a1; its slot is free/);
-  assert.match(removed.out, /tape-a1/);
+  assert.match(removed.out, /transcript stays on disk: tape-a1/);
+  assert.deepEqual(fs.readdirSync(path.join(state, sid)).filter((f) => f.startsWith('.removed-')), []);
   assert.ok(!fs.existsSync(path.join(state, sid, 'agents', 'a1')));
   assert.ok(!fs.existsSync(path.join(ask, 'q1.json')), 'its open asks go with it');
   assert.ok(fs.existsSync(path.join(state, sid, 'agents', 'a3')), 'others stay');
@@ -742,6 +743,12 @@ test('an idle colleague whose directory is gone does not hold a slot', async () 
   assert.equal((await runCoagent(['@b7', 'wait', '--timeout', '15'], env)).code, 0);
   const listed = await runCoagent(['agents'], env);
   assert.match(listed.out, /@b1/, 'still listed until removed');
+  const status = await runCoagent(['@b1'], env);
+  assert.match(status.out, /cwd: .*removed-worktree \(gone — the next send needs --cwd\)/);
+  // Seven now hold slots; reviving the gone one must not make it eight.
+  const revive = await runCoagent(['@b1', '--cwd', process.cwd(), 'back'], env);
+  assert.notEqual(revive.code, 0);
+  assert.match(revive.err, /max 6/);
   fs.rmSync(home, { recursive: true, force: true });
 });
 

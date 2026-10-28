@@ -92,7 +92,7 @@ coagent wait --all                   # wait for all; print as each lands
 coagent @review remove               # job done: free the slot
 ```
 
-The cap is 6 per lead session. `reset` gives a colleague a new tape but keeps its slot; `remove` drops it (refused while it is busy; its tapes stay on disk). An idle colleague whose `--cwd` no longer exists (a removed worktree) does not count toward the cap, and `wait`, `log` and `agents` still work on it; a send to it needs a new `--cwd`.
+The cap is 6 per lead session. `reset` gives a colleague a new tape but keeps its slot; `remove` drops it (refused while it is busy; its transcripts stay on disk, but `sessions` no longer lists them). An idle colleague whose `--cwd` no longer exists (a removed worktree) does not count toward the cap, and `wait`, `log` and `agents` still work on it; a send to it needs a new `--cwd`.
 
 ### Briefs
 

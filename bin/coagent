@@ -91,7 +91,7 @@ Usage:
   coagent watch [-f]             live tail of the inner transcript
   coagent reset                  new tape for @main (named colleagues keep theirs)
   coagent @name reset            new tape for that colleague (old tape stays on disk)
-  coagent @name remove           drop that colleague and free its slot (tapes stay on disk)
+  coagent @name remove           drop that colleague and free its slot (transcripts stay on disk)
   coagent sessions               inner sessions for this lead
   coagent resume <id>            make an old inner session current
 
@@ -789,7 +789,9 @@ function parseResult(out) {
 function holdsSlot(leadSessionId, name) {
   const key = agentKey(leadSessionId, name);
   const { cwd } = S.loadMeta(STATE_DIR, key);
-  return !cwd || fs.existsSync(cwd) || S.busy(STATE_DIR, key);
+  if (!cwd || fs.existsSync(cwd)) return true;
+  S.reapStale(STATE_DIR, key);
+  return S.busy(STATE_DIR, key);
 }
 
 // `send` is a turn about to run in the stored directory, so a gone one must
@@ -805,7 +807,9 @@ function resolveContext(cli, { create = true, send = false } = {}) {
   if (create) {
     const known = listAgentNames(lead.sessionId);
     const held = known.filter((n) => holdsSlot(lead.sessionId, n));
-    if (!known.includes(agentName) && held.length >= MAX_AGENTS) {
+    // A send revives a slotless colleague, so it must fit under the cap too.
+    // Other verbs (reset, resume) only rewrite state and stay allowed.
+    if (!(send ? held : known).includes(agentName) && held.length >= MAX_AGENTS) {
       fail(`already running ${held.length} colleagues (${held.join(', ')}) — max ${MAX_AGENTS}. Free one with \`coagent @name remove\`, or reuse one.`);
     }
     S.ensureLead(STATE_DIR, key);
@@ -1482,7 +1486,7 @@ function cmdStatus(cli) {
   console.log(`  inner: ${meta.sessionId || '(none — send a message to start one)'}${innerInfo.title ? `  "${innerInfo.title}"` : ''}`);
   const access = accessLabel(ctx.access, ctx.ha);
   console.log(`  model: ${ctx.model || '(default)'}  effort=${ctx.effort || '?'}${access ? `  ${access}` : ''}`);
-  console.log(`  cwd: ${ctx.cwd}`);
+  console.log(`  cwd: ${ctx.staleCwd ? `${ctx.staleCwd} (gone — the next send needs --cwd)` : ctx.cwd}`);
   console.log(`  worker: ${workerOn ? `pid=${w && w.pid}` : 'idle'}${w && w.childPid ? ` child=${w.childPid}` : ''}`);
   if (live.length) {
     console.log('  queue:');
@@ -1699,20 +1703,29 @@ function cmdReset(cli) {
   console.log(`  old tape kept. resume it with: coagent ${who}resume ${old}`);
 }
 
-function cmdRemove(cli) {
+async function cmdRemove(cli) {
   const name = cli.agentName;
   if (!name) fail('usage: coagent @name remove');
   const lead = resolveLead();
   migrateFlatState(lead.sessionId);
   if (!listAgentNames(lead.sessionId).includes(name)) fail(`no colleague @${name}`);
   const key = agentKey(lead.sessionId, name);
-  S.reapStale(STATE_DIR, key);
-  if (S.busy(STATE_DIR, key)) fail(`@${name} is busy — stop it first (coagent @${name} stop), then remove`);
+  await reap(key);
   const { sessionId } = S.loadMeta(STATE_DIR, key);
+  // Under the inbox lock a send cannot enqueue between the busy check and the
+  // move; one that lands after it starts a fresh colleague. The move takes
+  // the colleague out of the roster at once; deleting can happen unlocked.
+  const parked = path.join(STATE_DIR, lead.sessionId, `.removed-${name}-${S.newId()}`);
+  const moved = S.withInboxLock(STATE_DIR, key, () => {
+    if (S.busy(STATE_DIR, key)) return false;
+    fs.renameSync(path.join(STATE_DIR, key), parked);
+    return true;
+  });
+  if (!moved) fail(`@${name} is busy — stop it first (coagent @${name} stop), then remove`);
+  fs.rmSync(parked, { recursive: true, force: true });
   clearAsksFrom(lead.sessionId, name);
-  fs.rmSync(path.join(STATE_DIR, key), { recursive: true, force: true });
   console.log(`co-agent: removed @${name}; its slot is free`);
-  if (sessionId) console.log(`  its tapes stay on disk (last: ${sessionId})`);
+  if (sessionId) console.log(`  its last transcript stays on disk: ${sessionId}`);
 }
 
 function cmdLog(cli) {
@@ -1827,7 +1840,7 @@ async function main() {
   if (verb === 'watch') return await cmdWatch(cli);
   if (verb === 'log') return cmdLog(cli);
   if (verb === 'reset') return cmdReset(cli);
-  if (verb === 'remove') return cmdRemove(cli);
+  if (verb === 'remove') return await cmdRemove(cli);
   if (verb === 'sessions') return cmdSessions(cli);
   if (verb === 'resume') return cmdResume(cli, rest[1]);
   if (verb === 'doctor') return cmdDoctor();

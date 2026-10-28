@@ -99,8 +99,9 @@ conclusions are stale.
 inbox, and lock. Cap is 6 per lead session, and your sub-agents share
 it. **When a colleague's job is done, free it:
 `coagent @name remove`.** Reset keeps the slot; remove gives it back. Remove
-is refused while the colleague is busy (`stop` it first) and keeps its tapes
-on disk. Remove only colleagues you started. An idle colleague whose `--cwd`
+is refused while the colleague is busy (`stop` it first). Its transcripts
+stay on disk, but `sessions` no longer lists them. Remove only colleagues
+you started. An idle colleague whose `--cwd`
 is gone does not count toward the cap.
 
 `--cwd <dir>` is that colleague's working tree. It sticks. A different
