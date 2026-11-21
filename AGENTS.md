@@ -20,7 +20,9 @@ This checkout is the source. Runtime home is `~/.coagent/` (`state/` is not in g
 | `test/` | Unit + concurrency tests |
 | `persona.md` | Last-layer rules (seeded if missing) |
 | `skills/coagent/SKILL.md` | Agent skill. Install copies it to `~/.grok/skills/coagent` and links `~/.claude/skills/coagent` there |
-| `install.sh` | Copy code into home and install the skill; leave `state/` and an existing `persona.md` alone |
+| `hooks/no-foreground-wait.js` | Claude Code PreToolUse hook: refuses a foreground `coagent wait` (Node stdlib, no jq) |
+| `lib/install-hook.js` | Registers that hook in `~/.claude/settings.json`, replacing the old jq-based one; idempotent, keeps a backup |
+| `install.sh` | Copy code into home, install the skill and the hook; leave `state/` and an existing `persona.md` alone. Needs only bash, coreutils and node |
 
 ## Rules
 

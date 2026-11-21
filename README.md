@@ -31,6 +31,7 @@ One colleague **per harness session**. Send is background. The inner session per
 - **Home:** `~/.coagent/` (`state/` is not in git)
 - **Binary:** `~/.local/bin/coagent`
 - **Skill:** `~/.grok/skills/coagent/SKILL.md`, with `~/.claude/skills/coagent` linked to that directory
+- **Hook:** `~/.coagent/hooks/no-foreground-wait.js`, a Claude Code `PreToolUse` hook in `~/.claude/settings.json` that refuses a foreground `coagent wait` (re-run it with `run_in_background: true`). Install replaces the old jq-based `~/.claude/hooks/no-foreground-coagent-wait.sh` entry; delete that script once you've installed.
 
 ## Install
 
