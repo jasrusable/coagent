@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+      # install.sh into a throwaway home: no rsync or jq, and the hook entry lands once.
+      - name: install into a temp home
+        run: |
+          export HOME="$(mktemp -d)"
+          ./install.sh
+          ./install.sh
+          test -x "$HOME/.local/bin/coagent"
+          test -f "$HOME/.coagent/hooks/no-foreground-wait.js"
+          test "$(grep -c no-foreground-wait.js "$HOME/.claude/settings.json")" = 1
+          printf '%s' '{"tool_input":{"command":"coagent wait"}}' | node "$HOME/.coagent/hooks/no-foreground-wait.js" | grep -q deny

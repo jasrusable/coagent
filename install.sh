@@ -5,7 +5,10 @@
 #   ~/.coagent/{lib,test,README,persona…}
 #   ~/.grok/skills/coagent/SKILL.md
 #   ~/.claude/skills/coagent       → the grok skill dir
+#   ~/.coagent/hooks/no-foreground-wait.js, registered as a PreToolUse hook
+#     in ~/.claude/settings.json (replacing the old jq-based one; backup kept)
 #
+# Needs only bash, coreutils and node.
 # Runtime session state (~/.coagent/state) is left untouched.
 # An existing persona.md is left untouched. The skill is replaced.
 set -euo pipefail
@@ -16,15 +19,21 @@ BIN_DIR="${COAGENT_BIN_DIR:-$HOME/.local/bin}"
 CLAUDE_BIN="${COAGENT_CLAUDE_BIN:-$HOME/.claude/bin}"
 GROK_SKILLS="${COAGENT_GROK_SKILLS:-$HOME/.grok/skills}"
 CLAUDE_SKILLS="${COAGENT_CLAUDE_SKILLS:-$HOME/.claude/skills}"
+CLAUDE_SETTINGS="${COAGENT_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 
-mkdir -p "$HOME_DIR/lib" "$HOME_DIR/test" "$BIN_DIR" "$CLAUDE_BIN"
+# Replace a directory's contents with the checkout's (what rsync -a --delete did).
+mirror() {
+  rm -rf "$2.new"
+  cp -R "$1" "$2.new"
+  rm -rf "$2"
+  mv "$2.new" "$2"
+}
 
-rsync -a --delete \
-  --exclude '.git/' \
-  --exclude 'node_modules/' \
-  "$ROOT/lib/" "$HOME_DIR/lib/"
+mkdir -p "$HOME_DIR" "$BIN_DIR" "$CLAUDE_BIN"
 
-rsync -a --delete "$ROOT/test/" "$HOME_DIR/test/"
+mirror "$ROOT/lib" "$HOME_DIR/lib"
+mirror "$ROOT/test" "$HOME_DIR/test"
+mirror "$ROOT/hooks" "$HOME_DIR/hooks"
 cp "$ROOT/README.md" "$HOME_DIR/README.md"
 cp "$ROOT/AGENTS.md" "$HOME_DIR/AGENTS.md"
 cp "$ROOT/package.json" "$HOME_DIR/package.json"
@@ -46,6 +55,14 @@ else
   ln -sfn "$SKILL_DEST" "$CLAUDE_SKILLS/coagent"
 fi
 
+# The hook runs from an absolute node, so it works whatever PATH Claude Code
+# was started with. An fnm shell's node is a per-shell link that disappears,
+# so use the version it points to.
+NODE="${COAGENT_NODE:-$(command -v node)}"
+case "$NODE" in
+  *fnm_multishells*) NODE="$(cd "$(dirname "$NODE")" && pwd -P)/node" ;;
+esac
+
 echo "installed:"
 echo "  binary  $BIN_DIR/coagent"
 echo "  shim    $CLAUDE_BIN/coagent"
@@ -53,5 +70,7 @@ echo "  home    $HOME_DIR"
 echo "  lib     $HOME_DIR/lib"
 echo "  skill   $SKILL_DEST/SKILL.md"
 echo "  skill   $CLAUDE_SKILLS/coagent"
+mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+"$NODE" "$ROOT/lib/install-hook.js" "$CLAUDE_SETTINGS" "$NODE" "$HOME_DIR/hooks/no-foreground-wait.js"
 echo
 echo "try:  coagent --help && coagent doctor"

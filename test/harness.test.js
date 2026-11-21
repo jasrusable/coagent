@@ -283,10 +283,15 @@ test('resolveBin never picks a cmux wrapper shim', () => {
   const shimDir = path.join(home, 'cmux-cli-shims', 'abc');
   fs.mkdirSync(shimDir, { recursive: true });
   fs.writeFileSync(path.join(shimDir, 'claude'), '#!/bin/sh\n', { mode: 0o755 });
+  // The fallback is ~/.local/bin/claude; give the run a home that has one, so
+  // the test doesn't depend on Claude being installed (CI runners have none).
+  const localBin = path.join(home, '.local', 'bin');
+  fs.mkdirSync(localBin, { recursive: true });
+  fs.writeFileSync(path.join(localBin, 'claude'), '#!/bin/sh\n', { mode: 0o755 });
   const r = spawnSync(process.execPath, ['-e', `
     const H = require(${q(HARNESS)});
     console.log(H.resolveBin(H.byId('claude')));
-  `], { encoding: 'utf8', env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, COAGENT_CLAUDE_BIN: '' } });
+  `], { encoding: 'utf8', env: { ...process.env, HOME: home, PATH: `${shimDir}:${process.env.PATH}`, COAGENT_CLAUDE_BIN: '' } });
   assert.ok(!r.stdout.includes('cmux-cli-shims'), r.stdout);
   fs.rmSync(home, { recursive: true, force: true });
 });
